@@ -31,6 +31,11 @@ SETTING_NAMES = {
 }
 
 
+WEDGED_HINT = (
+    "The camera is not answering. If a program quit while it had the camera open, "
+    "the FX30 keeps waiting for it: turn the camera off and on (PC Remote stays on)."
+)
+
 # Sony's "Movie Recording State" property; libgphoto2 has no name for it.
 RECORDING_STATE = "d21d"
 
@@ -54,15 +59,19 @@ class CameraBase:
 class GPhotoCamera(CameraBase):
     backend = "gphoto2"
 
-    def __init__(self) -> None:
+    def __init__(self, idle_timeout: float = 10.0) -> None:
         self._camera = None
         self._lock = asyncio.Lock()
+        self._idle_task: asyncio.Task | None = None
+        self.idle_timeout = idle_timeout
         self.name = "camera"
         self.recording = False
 
     async def _run(self, fn, *args):
         import gphoto2 as gp
 
+        if self._idle_task:
+            self._idle_task.cancel()
         async with self._lock:
             try:
                 if self._camera is None:
@@ -72,8 +81,25 @@ class GPhotoCamera(CameraBase):
                 if err.code in (gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO,
                                 gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY, gp.GP_ERROR_TIMEOUT):
                     await self._drop()
-                    raise CameraError(f"{err}. {PC_REMOTE_HINT}") from err
+                    raise CameraError(f"{err}. {WEDGED_HINT if err.code == gp.GP_ERROR_TIMEOUT else PC_REMOTE_HINT}") from err
                 raise CameraError(str(err)) from err
+            finally:
+                self._idle_task = asyncio.create_task(self._close_when_idle())
+
+    async def _close_when_idle(self) -> None:
+        """Let go of the camera between uses. The FX30 keeps a session that was never
+        closed (a crash, a killed server) and refuses new ones until it is power cycled,
+        so the less time a session is open, the less often that happens."""
+
+        await asyncio.sleep(self.idle_timeout)
+        if self.recording:
+            return  # what closing does to a recording is untested; stay with it
+        # Once started, finish closing even if a new call arrives; it waits on the lock.
+        await asyncio.shield(self._close_locked())
+
+    async def _close_locked(self) -> None:
+        async with self._lock:
+            await self._drop()
 
     def _open(self):
         import gphoto2 as gp
@@ -187,8 +213,14 @@ class GPhotoCamera(CameraBase):
         raise CameraError(f"the camera did not take {int(wanted)}K (still {widget.get_value()})")
 
     def _frame(self) -> bytes:
-        data = self._camera.capture_preview().get_data_and_size()
-        return bytes(memoryview(data))
+        # Right after recording stops the camera can send an empty frame for a moment.
+        for _ in range(10):
+            data = bytes(memoryview(self._camera.capture_preview().get_data_and_size()))
+            start, end = data.find(b"\xff\xd8"), data.rfind(b"\xff\xd9")
+            if 0 <= start < end:
+                return data[start:end + 2]
+            time.sleep(0.2)
+        raise CameraError(f"live view sent no picture ({len(data)} bytes); is the camera showing live view?")
 
     def _recording(self) -> bool | None:
         """What the camera says, from Sony's Movie Recording State; None if it does not say."""
@@ -238,5 +270,7 @@ class GPhotoCamera(CameraBase):
         await self._run(self._record, on)
 
     async def close(self) -> None:
+        if self._idle_task:
+            self._idle_task.cancel()
         async with self._lock:
             await self._drop()
