@@ -71,7 +71,8 @@ points; `set_face_target` replaces them with a look you chose.
 - On the FX30 (Oct 27 2026, libgphoto2 2.5.34, Movie F Mode): it connects as a
   generic PTP camera, reads ISO, shutter, aperture and white balance, sets
   colour temperature (2500 to 9900K in 100K steps, read back to confirm) and
-  streams 1024x576 live view. Movie recording is offered; not yet tried.
+  streams 1024x576 live view. Start and stop recording work (a test left one
+  clip on the card); both now wait for Sony's Movie Recording State to agree.
 - ISO, shutter and aperture come through read-only in Movie F Mode, so set them
   on the camera. That fits the design: they stay fixed for an interview.
 - macOS's `ptpcamerad` claims the camera when it is plugged in. Opening the
