@@ -1,0 +1,32 @@
+[project]
+name = "fx30-mcp"
+version = "0.1.0"
+description = "Control a Sony FX30 from Claude Code and light a one-person talking head with an amaran light"
+readme = "README.md"
+authors = [
+    { name = "jtannahill", email = "161522526+jtannahill@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "amaran-mcp",
+    "gphoto2>=2.6.4",
+    "mcp>=2.3",
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "pyobjc-framework-vision>=12.2.2",
+]
+
+[project.scripts]
+fx30-mcp = "fx30_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+amaran-mcp = { path = "../amaran-mcp", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
