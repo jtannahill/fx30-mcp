@@ -31,6 +31,10 @@ SETTING_NAMES = {
 }
 
 
+# Sony's "Movie Recording State" property; libgphoto2 has no name for it.
+RECORDING_STATE = "d21d"
+
+
 class CameraError(Exception):
     pass
 
@@ -66,7 +70,7 @@ class GPhotoCamera(CameraBase):
                 return await asyncio.to_thread(fn, *args)
             except gp.GPhoto2Error as err:
                 if err.code in (gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO,
-                                gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY):
+                                gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY, gp.GP_ERROR_TIMEOUT):
                     await self._drop()
                     raise CameraError(f"{err}. {PC_REMOTE_HINT}") from err
                 raise CameraError(str(err)) from err
@@ -74,11 +78,15 @@ class GPhotoCamera(CameraBase):
     def _open(self):
         import gphoto2 as gp
 
+        # What ptpcamerad holding the camera looks like: refused outright, or
+        # half shared, so commands time out.
+        SHARED_ERRORS = (gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_TIMEOUT, gp.GP_ERROR_IO, gp.GP_ERROR_IO_USB_FIND)
         camera = gp.Camera()
         try:
             camera.init()
+            camera.get_single_config("cameramodel")
         except gp.GPhoto2Error as err:
-            if err.code != gp.GP_ERROR_IO_USB_CLAIM:
+            if err.code not in SHARED_ERRORS:
                 raise
             # macOS's ptpcamerad claims every camera that is plugged in. launchd
             # restarts it, but not before the camera is ours. The camera drops off
@@ -92,9 +100,7 @@ class GPhotoCamera(CameraBase):
                     camera.init()
                     break
                 except gp.GPhoto2Error as retry:
-                    if time.monotonic() > deadline or retry.code not in (
-                        gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO_USB_FIND,
-                    ):
+                    if time.monotonic() > deadline or retry.code not in SHARED_ERRORS + (gp.GP_ERROR_MODEL_NOT_FOUND,):
                         raise
         try:
             self.name = camera.get_single_config("cameramodel").get_value()
@@ -184,6 +190,16 @@ class GPhotoCamera(CameraBase):
         data = self._camera.capture_preview().get_data_and_size()
         return bytes(memoryview(data))
 
+    def _recording(self) -> bool | None:
+        """What the camera says, from Sony's Movie Recording State; None if it does not say."""
+
+        import gphoto2 as gp
+
+        try:
+            return int(self._camera.get_single_config(RECORDING_STATE).get_value()) != 0
+        except (gp.GPhoto2Error, ValueError):
+            return None
+
     def _record(self, on: bool) -> None:
         import gphoto2 as gp
 
@@ -193,11 +209,20 @@ class GPhotoCamera(CameraBase):
             raise CameraError("this camera does not offer movie recording over USB") from err
         widget.set_value(1 if on else 0)
         self._camera.set_single_config("movie", widget)
+        deadline = time.monotonic() + 3
+        while (state := self._recording()) is not None and state != on:
+            if time.monotonic() > deadline:
+                raise CameraError(
+                    f"the camera did not {'start' if on else 'stop'} recording "
+                    "(card in, space left, camera in movie mode?)"
+                )
+            time.sleep(0.1)
         self.recording = on
 
     async def settings(self) -> dict[str, Any]:
         out = await self._run(self._read)
-        out["recording"] = self.recording
+        state = await self._run(self._recording)
+        out["recording"] = self.recording if state is None else state
         return out
 
     async def set(self, setting: str, value: str) -> str:
