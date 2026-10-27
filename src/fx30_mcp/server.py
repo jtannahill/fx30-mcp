@@ -160,7 +160,7 @@ async def look() -> list[Image | TextContent]:
     settings = config.load()
     report = reading.summary()
     report["stops_to_target"] = round(meter.stops_off(reading.level, settings.target, settings.profile), 2)
-    off = reading.hue_off(settings.skin_hue)
+    off = reading.hue_off(settings.skin_hue) if reading.face else None
     report["hue_off"] = None if off is None else round(off, 1)
     return [Image(data=jpeg, format="jpeg"), TextContent(type="text", text=json.dumps(report))]
 

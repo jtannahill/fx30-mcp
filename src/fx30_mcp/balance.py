@@ -103,7 +103,8 @@ async def balance(
         stops = meter.stops_off(reading.level, settings.target, settings.profile)
         if reading.clipped > CLIP_LIMIT:
             stops = min(stops, -1 / 3)
-        hue_off = reading.hue_off(settings.skin_hue) if fix_tint else None
+        # Skin colour means something only on skin.
+        hue_off = reading.hue_off(settings.skin_hue) if fix_tint and reading.face else None
         step = Step(brightness, tint, reading.face, reading.level, stops, hue_off, reading.clipped)
 
         if steps and fix_tint and steps[-1].tint != tint and hue_off is not None and steps[-1].hue_off is not None:

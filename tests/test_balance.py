@@ -12,6 +12,15 @@ async def no_wait(_seconds: float) -> None:
     pass
 
 
+# Where the pretend camera draws its face, as Vision would report it.
+SIM_FACE = (100 / 320, 40 / 180, 120 / 320, 100 / 180)
+
+
+@pytest.fixture(autouse=True)
+def face_found(monkeypatch):
+    monkeypatch.setattr(meter, "find_face", lambda _jpeg: SIM_FACE)
+
+
 def run(camera, light, settings, **kwargs):
     return asyncio.run(balance(camera, light, settings, sleep=no_wait, **kwargs))
 
@@ -88,3 +97,12 @@ def test_tint_left_alone_when_asked():
     camera = SimCamera(light, gain=2.0, green_cast=0.12)
     result = run(camera, light, Settings(), fix_tint=False)
     assert result["done"] and result["light"]["tint"] == 0
+
+
+def test_tint_left_alone_without_a_face(monkeypatch):
+    monkeypatch.setattr(meter, "find_face", lambda _jpeg: None)
+    light = SimLight()
+    camera = SimCamera(light, gain=2.0, green_cast=0.12)
+    result = run(camera, light, Settings())
+    assert result["light"]["tint"] == 0
+    assert "no face found" in " ".join(result["notes"])
