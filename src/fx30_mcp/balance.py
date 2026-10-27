@@ -52,7 +52,7 @@ def advice(stops: float, profile: str) -> str:
     if stops > 0:
         iso = (
             "In S-Log3 the FX30's second native ISO, 2500, is about 1.6 stops above 800. "
-            if profile == "slog3" else "Raise ISO, "
+            if profile == "slog3" else "Raise ISO. "
         )
         return (
             f"The light is at full and the face is still {stops:.1f} stops under. {iso}"
