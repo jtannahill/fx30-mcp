@@ -1,7 +1,8 @@
 """Find the face in a live-view frame and read its exposure and colour.
 
 Exposure is the median brightness of the middle of the face (cheeks, nose,
-forehead), so hair, eyes and background do not pull it around. Colour is read
+forehead), so hair, eyes and background do not pull it around; on a face lit
+from one side it is the lit half that counts. Colour is read
 the way a colourist reads a vectorscope: every skin tone, light or dark, sits
 near one line on the scope (about 123 degrees), so a face pushed off that line
 shows a colour cast. Here, positive means toward green.
@@ -79,6 +80,20 @@ class Reading:
     clipped: float  # share of the face at or near white
     hue: float | None  # skin hue on the vectorscope in degrees, None when too grey to read
     chroma: float
+    sides: tuple[float, float] = (0.0, 0.0)  # median luma of the left and right halves
+
+    @property
+    def lit(self) -> float:
+        """What exposure is judged on: the lit side of a face, as with any side-lit
+        portrait, so the shadow side is free to fall where the fill puts it."""
+
+        return max(self.sides) if self.face else self.level
+
+    def contrast(self, profile: str) -> float:
+        """Stops between the lit and the shadow side of the face: the lighting ratio."""
+
+        bright, dark = max(self.sides), min(self.sides)
+        return stops_off(dark, bright, profile)
 
     def hue_off(self, reference: float = SKIN_LINE_DEGREES) -> float | None:
         """Degrees off the reference skin hue; positive is toward green."""
@@ -90,6 +105,7 @@ class Reading:
     def summary(self) -> dict:
         out = asdict(self)
         out["box"] = [round(v, 3) for v in self.box]
+        out["sides"] = [round(v, 3) for v in self.sides]
         for key in ("level", "clipped", "chroma"):
             out[key] = round(out[key], 3)
         if self.hue is not None:
@@ -140,10 +156,14 @@ def read(jpeg: bytes, box: Box | None = None) -> Reading:
     x, y, w, h = _inner(box) if face else box
     left, top = int(x * width), int(y * height)
     right, bottom = max(left + 1, int((x + w) * width)), max(top + 1, int((y + h) * height))
-    patch = rgb[top:bottom, left:right].reshape(-1, 3)
+    region = rgb[top:bottom, left:right]
+    middle = max(1, region.shape[1] // 2)
+    halves = [region[:, :middle], region[:, middle:] if region.shape[1] > 1 else region]
+    sides = tuple(float(np.median(_luma(half.reshape(-1, 3)))) for half in halves)
+    patch = region.reshape(-1, 3)
 
     r, g, b = patch[:, 0], patch[:, 1], patch[:, 2]
-    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    luma = _luma(patch)
     clipped = float(np.mean(patch.max(axis=1) >= CLIP_LEVEL))
     # Colour from the skin itself: not the shadows (eyes, brows) and not clipped shine.
     skin = (luma > np.percentile(luma, 20)) & (patch.max(axis=1) < CLIP_LEVEL)
@@ -153,4 +173,8 @@ def read(jpeg: bytes, box: Box | None = None) -> Reading:
     cr = float(np.mean((r[skin] - luma[skin]) * 0.713))
     chroma = math.hypot(cb, cr)
     hue = math.degrees(math.atan2(cr, cb)) % 360 if chroma >= MIN_CHROMA else None
-    return Reading(face, box, float(np.median(luma)), clipped, hue, chroma)
+    return Reading(face, box, float(np.median(luma)), clipped, hue, chroma, sides)
+
+
+def _luma(pixels: np.ndarray) -> np.ndarray:
+    return 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]

@@ -23,6 +23,8 @@ class Settings:
     skin_hue: float = SKIN_LINE_DEGREES
     tint_sign: int = 1  # +1: a higher tint on the light looks greener on camera
     key_light: str | None = None  # the light balance_shot steers, by its amaran name; None: amaran-mcp's light
+    fill_light: str | None = None  # the light on the shadow side, by its amaran name; None: no fill
+    fill_ratio: float = 1.0  # stops from the lit to the shadow side: 1 is 2:1, 2 is 4:1
 
     @property
     def target(self) -> float:

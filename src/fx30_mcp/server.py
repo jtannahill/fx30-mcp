@@ -56,6 +56,15 @@ def light() -> Any:
     return current_light() if name is None else named_light(name)
 
 
+def fill_light() -> Any:
+    """The fill light, or None when there is none."""
+
+    if BACKEND == "sim":
+        return None
+    name = config.load().fill_light
+    return None if name is None else named_light(name)
+
+
 def amaran_lights() -> list[dict[str, Any]]:
     """The lights amaran Desktop has paired, with their keys."""
 
@@ -115,8 +124,9 @@ mcp = MCPServer(
     "fx30",
     instructions=(
         "Controls the user's Sony FX30 over USB (PC Remote) and lights a one-person "
-        "talking head with their amaran light. The camera records to its own card. "
-        "Typical order: look (check framing), balance_shot (sets white balance on both, "
+        "talking head with their amaran lights: a key light on the face and an optional "
+        "fill on the shadow side (set_lights). The camera records to its own card. "
+        "Typical order: look (check framing), balance_shot (sets white balance on camera and lights, "
         "then brings the face to the target with the light), start_recording. "
         "Camera settings are best left fixed for an interview; balance_shot only "
         "changes the light. set_face_target saves a face brightness the user likes."
@@ -192,7 +202,7 @@ async def look() -> list[Image | TextContent]:
     reading = await asyncio.to_thread(meter.read, jpeg)
     settings = config.load()
     report = reading.summary()
-    report["stops_to_target"] = round(meter.stops_off(reading.level, settings.target, settings.profile), 2)
+    report["stops_to_target"] = round(meter.stops_off(reading.lit, settings.target, settings.profile), 2)
     off = reading.hue_off(settings.skin_hue) if reading.face else None
     report["hue_off"] = None if off is None else round(off, 1)
     return [Image(data=jpeg, format="jpeg"), TextContent(type="text", text=json.dumps(report))]
@@ -200,16 +210,19 @@ async def look() -> list[Image | TextContent]:
 
 @tool(annotations=CHANGES)
 async def match_white(kelvin: Kelvin) -> str:
-    """Set the light to white at this colour temperature and the camera's white balance to match."""
+    """Set the key and fill lights to white at this colour temperature and the camera's
+    white balance to match."""
 
     await take_over_light()
-    lamp = light()
-    await lamp.set_white(kelvin, None, 0)
+    lamps = [light()] + ([fill] if (fill := fill_light()) is not None else [])
+    for lamp in lamps:
+        await lamp.set_white(kelvin, None, 0)
+    which = "key and fill lights" if len(lamps) > 1 else "light"
     try:
         await camera().set_kelvin(kelvin)
     except CameraError as err:
-        return f"light at {kelvin}K; camera white balance not set ({err}), set it to {kelvin}K by hand"
-    return f"light and camera both at {kelvin}K"
+        return f"{which} at {kelvin}K; camera white balance not set ({err}), set it to {kelvin}K by hand"
+    return f"{which} and camera all at {kelvin}K"
 
 
 @tool(annotations=CHANGES)
@@ -218,9 +231,11 @@ async def balance_shot(
     fix_tint: Annotated[bool, Field(description="Also take out a green or magenta cast with the light's tint")] = True,
     max_steps: Annotated[int, Field(ge=1, le=20)] = 8,
 ) -> dict[str, Any]:
-    """Light the face to the saved target: matches white balance, then steps the light until
-    the face is within a sixth of a stop. Leaves the camera's exposure settings alone and says
-    what to change if the light runs out of range."""
+    """Light the face to the saved target: matches white balance on the camera and both lights,
+    then steps the key light until the lit side of the face is within a sixth of a stop and,
+    with a fill light set, the fill until the shadow side sits fill_ratio stops below it.
+    Leaves the camera's exposure settings alone and says what to change if a light runs out
+    of range."""
 
     if _busy.locked():
         raise ToolError("a balance is already running")
@@ -228,7 +243,7 @@ async def balance_shot(
         await take_over_light()
         settings = config.load()
         sign = settings.tint_sign
-        result = await balance(camera(), light(), settings, kelvin, fix_tint, max_steps)
+        result = await balance(camera(), light(), settings, kelvin, fix_tint, max_steps, fill=fill_light())
         if settings.tint_sign != sign:
             config.save(settings)
         return result
@@ -251,7 +266,7 @@ async def set_face_target(
         reading = await asyncio.to_thread(meter.read, await camera().frame())
         if not reading.face:
             raise ToolError("no face in frame; sit in the shot first, or give a level")
-        settings.face_level = round(reading.level, 3)
+        settings.face_level = round(reading.lit, 3)
         if reading.hue is not None:
             settings.skin_hue = round(reading.hue, 1)
     else:
@@ -261,20 +276,39 @@ async def set_face_target(
 
 
 @tool(annotations=CHANGES)
-async def set_key_light(
-    name: Annotated[str | None, Field(description="The light's amaran name, e.g. 'amaran 100x S #1'; leave out to list them")] = None,
+async def set_lights(
+    key: Annotated[str | None, Field(description="The key light's amaran name, e.g. 'amaran 100x S #1'")] = None,
+    fill: Annotated[str | None, Field(description="The fill light's amaran name, or 'none' for no fill")] = None,
+    fill_ratio: Annotated[float | None, Field(ge=0.25, le=4, description="Stops from the lit to the shadow side: 1 is 2:1 (classic interview), 2 is 4:1 (moodier)")] = None,
 ) -> dict[str, Any]:
-    """Choose which amaran light balance_shot and match_white steer: the key light on the face.
-    With no name, lists the lights amaran Desktop has paired and which one is the key."""
+    """Choose the key light (on the face), the fill (on the shadow side) and the lighting ratio
+    balance_shot aims for. With nothing given, lists the lights amaran Desktop has paired."""
 
     settings = config.load()
     lights = [{"name": f["name"], "model": f["model"]} for f in amaran_lights()] if BACKEND != "sim" else []
-    if name is not None:
+    if key is not None:
         if BACKEND != "sim":
-            named_light(name)  # fails here, listing the choices, if Desktop has no such light
-        settings.key_light = name
+            named_light(key)  # fails here, listing the choices, if Desktop has no such light
+        settings.key_light = key
+    if fill is not None:
+        if fill.lower() == "none":
+            settings.fill_light = None
+        else:
+            if BACKEND != "sim":
+                named_light(fill)
+            settings.fill_light = fill
+    if settings.fill_light and settings.key_light and settings.fill_light.lower() == settings.key_light.lower():
+        raise ToolError("the key and the fill must be two different lights")
+    if fill_ratio is not None:
+        settings.fill_ratio = fill_ratio
+    if key is not None or fill is not None or fill_ratio is not None:
         config.save(settings)
-    return {"key_light": settings.key_light or "amaran-mcp's light", "lights": lights}
+    return {
+        "key": settings.key_light or "amaran-mcp's light",
+        "fill": settings.fill_light,
+        "fill_ratio": settings.fill_ratio,
+        "lights": lights,
+    }
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

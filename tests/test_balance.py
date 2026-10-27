@@ -26,7 +26,7 @@ def run(camera, light, settings, **kwargs):
 
 
 def face_stops(camera, settings):
-    return meter.stops_off(meter.read(camera.render()).level, settings.target, settings.profile)
+    return meter.stops_off(meter.read(camera.render()).lit, settings.target, settings.profile)
 
 
 @pytest.mark.parametrize("start", [5.0, 30.0, 95.0])
@@ -106,3 +106,34 @@ def test_tint_left_alone_without_a_face(monkeypatch):
     result = run(camera, light, Settings())
     assert result["light"]["tint"] == 0
     assert "no face found" in " ".join(result["notes"])
+
+
+@pytest.mark.parametrize("ratio", [1.0, 2.0])
+def test_sets_the_lighting_ratio_with_a_fill(ratio):
+    key, fill = SimLight(), SimLight()
+    fill.state.brightness = 5.0
+    camera = SimCamera(key, gain=2.0, fill=fill, fill_gain=0.6, key_spill=0.1)
+    settings = Settings(fill_ratio=ratio)
+    result = run(camera, key, settings, fill=fill, max_steps=12)
+    assert result["done"], result
+    reading = meter.read(camera.render())
+    assert abs(reading.contrast(settings.profile) - ratio) <= 0.25
+    assert abs(face_stops(camera, settings)) <= 1 / 6
+    assert fill.state.kelvin == key.state.kelvin
+
+
+def test_fill_too_weak_says_so():
+    key, fill = SimLight(), SimLight()
+    camera = SimCamera(key, gain=2.0, fill=fill, fill_gain=0.01, key_spill=0.05)
+    result = run(camera, key, Settings(fill_ratio=0.5), fill=fill, max_steps=12)
+    assert not result["done"]
+    assert result["fill"]["brightness"] == 100.0
+    assert "deeper than wanted" in result["fill"]["advice"]
+
+
+def test_meter_finds_the_lit_side():
+    key = SimLight()
+    camera = SimCamera(key, gain=2.0, key_spill=0.5)
+    reading = meter.read(camera.render())
+    assert reading.sides[0] > reading.sides[1]
+    assert reading.contrast("rec709") == pytest.approx(1.0, abs=0.15)

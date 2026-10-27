@@ -2,7 +2,8 @@
 
 The camera renders a flat skin-coloured face lit by the pretend light: brighter
 with brightness (along a curve, as real dimmers are), greener or more magenta
-with tint and with a green cast from the "room".
+with tint and with a green cast from the "room". With key_spill below 1 the key
+lights the left half of the face more than the right, which a fill light lifts.
 """
 
 from __future__ import annotations
@@ -71,6 +72,9 @@ class SimCamera(CameraBase):
         curve: float = 1.6,  # light output goes as brightness ** curve
         green_cast: float = 0.0,
         tint_sign: int = 1,  # +1: a higher tint is greener
+        fill: SimLight | None = None,
+        fill_gain: float = 1.0,
+        key_spill: float = 1.0,  # share of the key reaching the right half of the face
     ) -> None:
         self.name = "pretend camera"
         self.light = light
@@ -79,18 +83,27 @@ class SimCamera(CameraBase):
         self.curve = curve
         self.green_cast = green_cast
         self.tint_sign = tint_sign
+        self.fill = fill
+        self.fill_gain = fill_gain
+        self.key_spill = key_spill
         self.kelvin: int | None = None
         self.recording = False
         self.values: dict[str, Any] = {"iso": "800", "shutter": "1/50", "aperture": "f/2.8"}
 
+    def _output(self, light: SimLight | None, gain: float) -> float:
+        if light is None or not light.state.power:
+            return 0.0
+        return gain * ((light.state.brightness or 0) / 100) ** self.curve
+
     def render(self) -> bytes:
-        level = (self.light.state.brightness or 0) / 100
-        exposure = self.gain * level**self.curve if self.light.state.power else 0.0
+        key = self._output(self.light, self.gain)
+        fill = self._output(self.fill, self.fill_gain)
         green = 1 + self.green_cast + 0.02 * (self.light.state.tint or 0) * self.tint_sign
-        face = SKIN * exposure * np.array([1.0, green, 1.0])
+        tone = SKIN * np.array([1.0, green, 1.0])
         encode = PROFILES[self.profile][1]
-        frame = np.full((180, 320, 3), float(encode(np.array(0.02 * exposure))))
-        frame[40:140, 100:220] = encode(np.clip(face, 0, 1.2))
+        frame = np.full((180, 320, 3), float(encode(np.array(0.02 * key))))
+        frame[40:140, 100:160] = encode(np.clip(tone * (key + 0.1 * fill), 0, 1.2))
+        frame[40:140, 160:220] = encode(np.clip(tone * (key * self.key_spill + fill), 0, 1.2))
         pixels = (np.clip(frame, 0, 1) * 255).round().astype(np.uint8)
         out = io.BytesIO()
         Image.fromarray(pixels).save(out, "JPEG", quality=95)
