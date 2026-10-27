@@ -11,6 +11,8 @@ Calls into libgphoto2 block, so each runs in a worker thread, one at a time.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import time
 from typing import Any
 
 PC_REMOTE_HINT = (
@@ -73,8 +75,31 @@ class GPhotoCamera(CameraBase):
         import gphoto2 as gp
 
         camera = gp.Camera()
-        camera.init()
-        self.name = camera.get_abilities().model
+        try:
+            camera.init()
+        except gp.GPhoto2Error as err:
+            if err.code != gp.GP_ERROR_IO_USB_CLAIM:
+                raise
+            # macOS's ptpcamerad claims every camera that is plugged in. launchd
+            # restarts it, but not before the camera is ours. The camera drops off
+            # USB for a moment when it lets go, so keep trying for a few seconds.
+            deadline = time.monotonic() + 8
+            while True:
+                subprocess.run(["killall", "-9", "ptpcamerad"], capture_output=True)
+                time.sleep(0.5)
+                camera = gp.Camera()
+                try:
+                    camera.init()
+                    break
+                except gp.GPhoto2Error as retry:
+                    if time.monotonic() > deadline or retry.code not in (
+                        gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO_USB_FIND,
+                    ):
+                        raise
+        try:
+            self.name = camera.get_single_config("cameramodel").get_value()
+        except gp.GPhoto2Error:
+            self.name = camera.get_abilities().model
         return camera
 
     async def _drop(self) -> None:
@@ -109,6 +134,11 @@ class GPhotoCamera(CameraBase):
         import gphoto2 as gp
 
         name, widget = self._widget(setting)
+        if widget.get_readonly():
+            raise CameraError(
+                f"the camera keeps {setting} on its own controls in this mode "
+                f"(now {widget.get_value()}); change it on the camera"
+            )
         if widget.get_type() in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
             choices = [widget.get_choice(i) for i in range(widget.count_choices())]
             match = next((c for c in choices if c.lower() == value.lower()), None)
@@ -129,16 +159,26 @@ class GPhotoCamera(CameraBase):
         manual = next((c for c in choices if "temp" in c.lower() or "kelvin" in c.lower()), None)
         if manual is None:
             raise CameraError(f"no colour temperature white balance offered; choices: {', '.join(choices)}")
-        self._write("white_balance", manual)
+        if widget.get_value() != manual:
+            self._write("white_balance", manual)
+            time.sleep(0.5)  # a write straight after a mode change is ignored
         name, widget = self._widget("kelvin")
         if widget.get_type() in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
             self._write("kelvin", min(
                 (widget.get_choice(i) for i in range(widget.count_choices())),
                 key=lambda c: abs(int("".join(ch for ch in c if ch.isdigit()) or 0) - kelvin),
             ))
-        else:
-            widget.set_value(kelvin if widget.get_type() == gp.GP_WIDGET_RANGE else str(kelvin))
+            return
+        low, high, step = widget.get_range() if widget.get_type() == gp.GP_WIDGET_RANGE else (0, 1e9, 1)
+        wanted = float(min(high, max(low, round(kelvin / step) * step)))
+        for _ in range(3):
+            widget.set_value(wanted if widget.get_type() == gp.GP_WIDGET_RANGE else str(int(wanted)))
             self._camera.set_single_config(name, widget)
+            time.sleep(0.2)
+            _name, widget = self._widget("kelvin")
+            if float(widget.get_value()) == wanted:
+                return
+        raise CameraError(f"the camera did not take {int(wanted)}K (still {widget.get_value()})")
 
     def _frame(self) -> bytes:
         data = self._camera.capture_preview().get_data_and_size()

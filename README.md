@@ -68,9 +68,13 @@ points; `set_face_target` replaces them with a look you chose.
 
 - Metering, the balancing loop and the tools are tested against the pretend
   camera (`uv run pytest`), and face finding against a real portrait.
-- The camera side runs through libgphoto2 2.5.34, which lists the FX3 in PC
-  Control mode but not the FX30 by name. Whether it drives the FX30's settings
-  and movie recording is not yet tried on the camera.
-- Sony's Camera Remote SDK does list the FX30 (USB, Wi-Fi, LAN; macOS
-  supported). It needs an application to Sony, and would plug in as another
-  `CameraBase` in `camera.py` if libgphoto2 falls short.
+- On the FX30 (Oct 27 2026, libgphoto2 2.5.34, Movie F Mode): it connects as a
+  generic PTP camera, reads ISO, shutter, aperture and white balance, sets
+  colour temperature (2500 to 9900K in 100K steps, read back to confirm) and
+  streams 1024x576 live view. Movie recording is offered; not yet tried.
+- ISO, shutter and aperture come through read-only in Movie F Mode, so set them
+  on the camera. That fits the design: they stay fixed for an interview.
+- macOS's `ptpcamerad` claims the camera when it is plugged in. Opening the
+  camera stops it (launchd brings it back) and retries for a few seconds.
+- Sony's Camera Remote SDK also lists the FX30, and would plug in as another
+  `CameraBase` in `camera.py` if something here falls short.
