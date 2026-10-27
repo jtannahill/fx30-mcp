@@ -35,6 +35,7 @@ or the light's distance (half the distance is two stops more).
 | `balance_shot` | Matches white balance, then lights the face to the target |
 | `set_face_target` | Saves the face brightness and skin colour to aim for: light it how you like, then call it with no level |
 | `match_white` | Light and camera to one colour temperature |
+| `set_key_light` | Which amaran light lights the face (balance_shot steers it); with no name, lists the lights amaran Desktop has paired |
 | `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, recording state |
 | `start_recording` / `stop_recording` | Record to the card |
 
@@ -49,6 +50,9 @@ uv sync
 uv run fx30-mcp check          # connects, prints settings, meters one frame
 claude mcp add -s user fx30 -- uv --directory ~/src/fx30-mcp run fx30-mcp serve
 ```
+
+With several amaran lights paired in amaran Desktop, `set_key_light` picks the one
+on the face (say a 100x S); the others stay free for accents through amaran-mcp.
 
 The light comes from [amaran-mcp](https://github.com/jtannahill/amaran-mcp)
 (a sibling checkout in `../amaran-mcp`), through amaran Desktop when it is

@@ -24,6 +24,7 @@ BACKEND = os.environ.get("FX30_BACKEND", "gphoto2").lower()
 
 _camera: CameraBase | None = None
 _sim_light: Any = None
+_named_lights: dict[tuple[str, str], Any] = {}  # (name, backend) -> light
 _busy = asyncio.Lock()
 
 
@@ -51,7 +52,37 @@ def light() -> Any:
         return _sim_light
     from amaran_mcp.backends import current_light
 
-    return current_light()
+    name = config.load().key_light
+    return current_light() if name is None else named_light(name)
+
+
+def amaran_lights() -> list[dict[str, Any]]:
+    """The lights amaran Desktop has paired, with their keys."""
+
+    from amaran_mcp.config import find_desktop_db, list_desktop_fixtures
+
+    return list_desktop_fixtures(find_desktop_db())
+
+
+def named_light(name: str) -> Any:
+    """One of several amaran lights: through amaran Desktop when it runs, else Bluetooth."""
+
+    from amaran_mcp.backends import choose
+    from amaran_mcp.config import Light, load_light
+    from amaran_mcp.desktop import DesktopLight
+    from amaran_mcp.light import AmaranLight
+
+    backend = choose()
+    if (name, backend) not in _named_lights:
+        fixtures = amaran_lights()
+        fixture = next((f for f in fixtures if f["name"].lower() == name.lower()), None)
+        if fixture is None:
+            raise ValueError(f"amaran Desktop has no light named {name!r}; it has "
+                             + ", ".join(repr(f["name"]) for f in fixtures))
+        # Send as amaran-mcp's own mesh address, so the lights' message counters stay in step.
+        light = Light(source_address=load_light().source_address, **fixture)
+        _named_lights[(name, backend)] = DesktopLight(light) if backend == "desktop" else AmaranLight(light)
+    return _named_lights[(name, backend)]
 
 
 async def take_over_light() -> None:
@@ -75,6 +106,8 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         if BACKEND != "sim":
             from amaran_mcp.backends import close_all
 
+            for lamp in _named_lights.values():
+                await lamp.close()
             await close_all()
 
 
@@ -225,6 +258,23 @@ async def set_face_target(
         settings.face_level = level
     config.save(settings)
     return settings.__dict__
+
+
+@tool(annotations=CHANGES)
+async def set_key_light(
+    name: Annotated[str | None, Field(description="The light's amaran name, e.g. 'amaran 100x S #1'; leave out to list them")] = None,
+) -> dict[str, Any]:
+    """Choose which amaran light balance_shot and match_white steer: the key light on the face.
+    With no name, lists the lights amaran Desktop has paired and which one is the key."""
+
+    settings = config.load()
+    lights = [{"name": f["name"], "model": f["model"]} for f in amaran_lights()] if BACKEND != "sim" else []
+    if name is not None:
+        if BACKEND != "sim":
+            named_light(name)  # fails here, listing the choices, if Desktop has no such light
+        settings.key_light = name
+        config.save(settings)
+    return {"key_light": settings.key_light or "amaran-mcp's light", "lights": lights}
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

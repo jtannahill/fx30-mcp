@@ -22,6 +22,7 @@ class Settings:
     face_level: float | None = None
     skin_hue: float = SKIN_LINE_DEGREES
     tint_sign: int = 1  # +1: a higher tint on the light looks greener on camera
+    key_light: str | None = None  # the light balance_shot steers, by its amaran name; None: amaran-mcp's light
 
     @property
     def target(self) -> float:
