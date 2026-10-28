@@ -77,7 +77,8 @@ def test_a_cancelled_anyio_scope_still_waits_for_the_thread():
         scopes[0].cancel()
         await asyncio.sleep(0.02)
         await asyncio.create_task(camera._run(blocking, "second", 0.0))
-        await asyncio.wait([first])
+        await first
+        assert scopes[0].cancelled_caught and not first.cancelled()
         camera._idle_task.cancel()
 
     asyncio.run(go())

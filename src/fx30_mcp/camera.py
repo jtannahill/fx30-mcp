@@ -120,22 +120,22 @@ class GPhotoCamera(CameraBase):
         import gphoto2 as gp
 
         future = asyncio.ensure_future(asyncio.to_thread(fn, *args))
-        cancelled = False
+        cancelled: asyncio.CancelledError | None = None
         while not future.done():
             try:
                 await asyncio.wait([future])
-            except asyncio.CancelledError:
-                cancelled = True
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
         if future.cancelled():
-            raise asyncio.CancelledError
+            raise cancelled or asyncio.CancelledError()
         error = future.exception()
         if keep and error is None:
             self._camera = future.result()
-        if not cancelled:
+        if cancelled is None:
             return future.result()
         if isinstance(error, gp.GPhoto2Error) and error.code in _wedged_codes(gp):
             await self._drop()
-        raise asyncio.CancelledError
+        raise cancelled
 
     async def _run(self, fn, *args):
         import gphoto2 as gp
