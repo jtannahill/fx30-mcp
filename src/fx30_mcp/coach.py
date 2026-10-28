@@ -43,6 +43,7 @@ MAX_RECOMPUTES = 4
 LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO"}  # asked in this order
 ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from when the camera cannot say
 CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
+DARKEST = ("The camera can't darken this window any further", "ND film or a sheer curtain on the glass would.")
 HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
 RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
 
@@ -209,7 +210,7 @@ class Coach:
                 card = self.plan.camera
                 await self._camera_step()
                 if self.plan.camera == card:
-                    await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, self._window_holds)
+                    await self._wait("balance", *DARKEST, self._window_holds)
             self._check()
             self._show("ready", "Ready to record", None)
         except _Stopped:

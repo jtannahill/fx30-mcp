@@ -534,14 +534,16 @@ def test_window_clipping_with_the_card_at_its_darkest_says_so(monkeypatch):
         same = coach.plan
         monkeypatch.setattr(coach_module, "make_plan", lambda *_args, **_kwargs: same)
 
-    hopeless = at("balance", "The key can't hold this window right now")
+    darkest = at("balance", "The camera can't darken this window any further")
     walk(
         coach,
         when(coach, at("place_key"), coach.light_in_place),
         when(coach, at("balance"), brighter_sky_and_no_darker_card),
-        when(coach, hopeless, coach.stop),
+        when(coach, darkest, coach.stop),
     )
-    assert any(hopeless(s) for s in states)
+    shown = next(s for s in states if darkest(s))
+    assert shown["detail"] == "ND film or a sheer curtain on the glass would."
+    assert not any(s["instruction"] == "The key can't hold this window right now" for s in states)
     assert not any(s["step"] == "ready" for s in states)
 
 
