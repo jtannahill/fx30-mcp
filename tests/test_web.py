@@ -1,5 +1,8 @@
 import asyncio
 import json
+import logging
+import signal
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -132,3 +135,54 @@ def test_published_plan_says_whether_there_is_a_fill(monkeypatch):
 
     assert asyncio.run(has_fill(None)) is False
     assert asyncio.run(has_fill(SimLight())) is True
+
+
+def test_broadcaster_close_ends_open_streams():
+    async def go():
+        broadcaster = Broadcaster()
+        broadcaster.publish({"n": 1})
+        stream = broadcaster.subscribe()
+        assert await anext(stream) == {"n": 1}
+        broadcaster.close()
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert not broadcaster._queues
+
+    asyncio.run(go())
+
+
+def test_close_is_quick_with_an_open_stream(caplog):
+    async def go():
+        coach, broadcaster = build()
+        broadcaster.publish({"screen": "plan"})
+        handle = await start_web(coach, broadcaster)
+        port = int(handle.url.split(":")[2].split("/")[0])
+        key = handle.url.split("key=")[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"GET /events?key={key} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        await writer.drain()
+        assert b"200" in await reader.read(200)
+        started = time.monotonic()
+        await handle.close()
+        took = time.monotonic() - started
+        writer.close()
+        return took
+
+    with caplog.at_level(logging.WARNING):
+        took = asyncio.run(go())
+    assert took < 1.0
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_the_page_leaves_signal_handling_to_the_process():
+    async def go():
+        before = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        coach, broadcaster = build()
+        handle = await start_web(coach, broadcaster)
+        try:
+            await asyncio.sleep(0.05)
+            assert {sig: signal.getsignal(sig) for sig in before} == before
+        finally:
+            await handle.close()
+
+    asyncio.run(go())

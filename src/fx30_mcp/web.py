@@ -8,13 +8,14 @@ back the link and a QR code for the phone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import secrets
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator
 
 import segno
 import uvicorn
@@ -28,6 +29,7 @@ from .coach import Coach
 PAGE = Path(__file__).parent / "static" / "coach.html"
 COOKIE = "fx30_key"
 NO_REFERRER = {"Referrer-Policy": "no-referrer"}
+_END = object()  # queued by close(): the stream ends
 
 
 class Broadcaster:
@@ -36,22 +38,32 @@ class Broadcaster:
     def __init__(self) -> None:
         self.latest: dict | None = None
         self._queues: set[asyncio.Queue] = set()
+        self._closed = False
 
     def publish(self, state: dict) -> None:
         self.latest = state
         for queue in self._queues:
             queue.put_nowait(state)
 
-    async def subscribe(self) -> AsyncIterator[dict]:
-        """The latest state first (if there is one), then each new one."""
+    def close(self) -> None:
+        """End every open stream, and any opened later, so the page server can stop at once."""
 
+        self._closed = True
+        for queue in self._queues:
+            queue.put_nowait(_END)
+
+    async def subscribe(self) -> AsyncIterator[dict]:
+        """The latest state first (if there is one), then each new one, until close()."""
+
+        if self._closed:
+            return
         queue: asyncio.Queue = asyncio.Queue()
         self._queues.add(queue)
         try:
             if self.latest is not None:
                 yield self.latest
-            while True:
-                yield await queue.get()
+            while (state := await queue.get()) is not _END:
+                yield state
         finally:
             self._queues.discard(queue)
 
@@ -108,14 +120,24 @@ def make_app(coach: Coach, key: str, broadcaster: Broadcaster) -> Starlette:
     )
 
 
+class _Server(uvicorn.Server):
+    """uvicorn without its SIGINT and SIGTERM handlers: the MCP process keeps its own."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        yield
+
+
 @dataclass
 class WebHandle:
     url: str
     qr_png: bytes
     _server: uvicorn.Server
     _task: asyncio.Task
+    _broadcaster: Broadcaster
 
     async def close(self) -> None:
+        self._broadcaster.close()  # open event streams finish, so shutdown need not wait them out
         self._server.should_exit = True
         await self._task
 
@@ -140,7 +162,7 @@ async def start_web(coach: Coach, broadcaster: Broadcaster, port: int = 0) -> We
         log_level="warning",
         timeout_graceful_shutdown=2,
     )
-    server = uvicorn.Server(config)
+    server = _Server(config)
     task = asyncio.create_task(server.serve())
     while not server.started:
         if task.done():
@@ -151,4 +173,4 @@ async def start_web(coach: Coach, broadcaster: Broadcaster, port: int = 0) -> We
     url = f"http://{lan_ip()}:{bound}/?key={key}"
     qr = io.BytesIO()
     segno.make(url).save(qr, kind="png", scale=8)
-    return WebHandle(url, qr.getvalue(), server, task)
+    return WebHandle(url, qr.getvalue(), server, task, broadcaster)

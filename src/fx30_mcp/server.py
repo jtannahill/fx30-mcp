@@ -461,9 +461,9 @@ async def coach_shot(
         except LightError as err:
             raise ToolError(str(err)) from err
         except asyncio.CancelledError:
-            if start.cancelled():
+            if start.cancelled() and _coach is not coach:
                 raise ToolError("the shot coach was stopped before it began") from None
-            raise
+            raise  # the client cancelled coach_shot itself
         if plan is None:
             raise ToolError("No face in the frame. Sit in the shot, then call coach_shot again.")
         web = await start_web(coach, broadcaster)

@@ -330,3 +330,16 @@ def test_coach_shot_checks_frame_rate_and_widest_aperture(server, kwargs, match)
         assert not server._busy.locked()
 
     asyncio.run(go())
+
+
+def test_a_client_cancelling_coach_shot_is_a_cancel_not_a_stop(server):
+    async def go():
+        starting = asyncio.create_task(server.coach_shot(modifier="bare"))
+        while server._coach_task is None:
+            await asyncio.sleep(0)
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+        assert server._coach is None and not server._busy.locked()
+
+    asyncio.run(go())
