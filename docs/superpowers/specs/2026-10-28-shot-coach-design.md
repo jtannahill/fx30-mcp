@@ -133,31 +133,55 @@ setting, default 1 stop).
 
 **Camera** (shown as the "Set on the camera" card):
 
-- Shutter twice the frame rate (1/50 for 24p or 25p, 1/60 for 30p).
+- Shutter twice the frame rate. The owner shoots 29.97p in XAVC S 4K, so 1/60.
+- The coach reads the frame rate, recording format and picture profile (S-Log3
+  or not, and whether Gamma Display Assist is on, if exposed) from the camera's
+  Sony properties; the owner expects it to tell from the camera rather than be
+  asked. It asks once only for what the camera does not report, and saves the
+  answer.
 - ISO 800 in S-Log3 (base). 2500 only when the whole room is dark and the window
   is not in play.
-- Aperture: start at the widest the lens allows down to f/2.8. A bright window
-  is fixed by more key, not by stopping down: stopping down darkens their face and
-  the window equally and leaves the key further short.
+- Aperture: set from the window (see below), never wider than the lens allows
+  and no wider than f/2.8. With no window in play, the widest down to f/2.8.
+- No ND filter (the owner has none). On a sunny day the window can need more
+  than the lens and 1/60 can hold: on Oct 28 the owner was holding a sunlit
+  Midtown view at ISO 800, f/11, 1/400, which is about f/32 at 1/60. Order of
+  fallbacks: stop down to f/11, then f/16; then raise the shutter (1/125,
+  1/250, 1/500) and say in one line that motion will look a little crisper, and
+  that a variable ND would bring the shutter back to 1/60. An ND does not change
+  how much brighter the window is than the face; only the key does that.
 - Kelvin: 5600 by default. If the window reads clearly blue, raise camera and
   lights together up to 6500 (the 100x S's limit) so the backdrop does not go
   cyan; the existing tint loop handles green and magenta.
 
-**Window and face together.** The window's brightness over their face is a
-property of the scene: only the key's output and distance (or a sheer on the
-window) change it; ISO and aperture move both together. So the plan computes:
+**Window and face together.** (Decision made after the builder check; Claude's
+call, on the physics.) The camera's exposure sets where the window lands in the
+recording; the key sets where the face lands. So the order is:
 
-- the stops from the face target up to clipping in the recording's curve
-  (S-Log3 has several stops above a properly exposed face; Rec.709 only about two);
-- the stops the window sits above the face once the key brings the face to target.
+1. **Camera from the window.** Choose the aperture (ISO stays at base, shutter
+   at twice the frame rate) that puts the window inside the window range, below
+   clipping. In S-Log3 there are several stops between a well exposed face and
+   clipping; in Rec.709 about two.
+2. **Key to the face.** The key brings the face up to target at that exposure.
+3. **If the key runs out** (100% and the face still under), the key must go
+   closer: half the distance is two stops, so the distance factor is
+   2 ** (-stops_short / 2). If that puts it under about 18 in from the face, the
+   100x S cannot hold this window at this time of day: say so and offer the
+   last-resort fix (a sheer curtain or ND film on the glass), or opening up and
+   letting the window sit higher in its range.
 
-If the window would clip with the face at target, the plan says up front how much
-closer the key must go (half the distance is two stops; the distance factor is
-2 ** (-excess / 2)). If that distance is impractical (under about 18 in from the
-face, or in frame), it says the 100x S cannot hold this window at this time of
-day and offers the last-resort fix (a sheer curtain or ND film on the glass). If
-the camera itself is exposing the window into clipping, it says how many stops to
-stop down, with the matching key change.
+The verdict on whether the key can hold the window comes from the first key-on
+reading in coach step 2, not before (Claude's call: predicting it before the key
+is on would need a photometric model of each modifier plus calibration). The
+plan starts from a rule-of-thumb distance. Each session records the key's
+measured output (stops at the face per brightness, at the planned distance, per
+modifier) in settings, so later plans can predict the level and give the verdict
+on the plan screen.
+
+**Window range** (Claude's call; the owner can change it): the window sits 2 to 4
+stops above the face, and never clips. Under 1.5 stops it reads as a dull grey
+backdrop and the Window light goes amber. Like the face target, it can be saved
+from a frame the owner likes.
 
 ### 3. Live coach
 
@@ -166,7 +190,7 @@ A sequence of steps, each with one big instruction and the three lights:
 1. **Camera**: "Set f/2.8 on the camera" until the readback matches; then the
    next setting. Skipped when everything already matches.
 2. **Place the key**: "Key on camera-left, 3 ft, 1.5 ft above your eyes." They
-   says or taps when it is there. The coach then compares a key-off and a key-on
+   say or tap when it is there. The coach then compares a key-off and a key-on
    frame (the key's contribution alone) and checks which half of the face it
    lights. Wrong side gives "Key is on the wrong side: move it to camera-left."
    Best effort: if the eyes are big enough in the frame, find the catchlight in
@@ -176,7 +200,13 @@ A sequence of steps, each with one big instruction and the three lights:
 3. **Balance**: run the existing balance loop for the key (and fill), with the
    Window light watching the window. Out-of-range advice is turned into one
    instruction with a number ("Key closer: 3 ft to 2.5 ft").
-4. **Ready**: all three lights green; "Ready to record."
+4. **Ready**: all three lights green; "Ready to record." The coach stops reading
+   live view here.
+
+The coach ends at Ready (Claude's call). `start_recording` while the coach runs
+stops the coach first, so live view is never pulled during a recording (untested
+on the FX30, and a stuck session needs a power cycle). `look` and
+`set_face_target` share the camera lock and are allowed.
 
 Traffic lights:
 
@@ -208,8 +238,10 @@ in place.
 - `coach_shot`: survey, plan, start the page; returns the link, a QR code image
   for the phone, and the plan as JSON so Claude can talk them through it too.
 - `stop_coach`: stop the page and the loop, leaving the camera and lights as they are.
-- Settings gain the key modifier and its size, units (ft or m), and the window
-  range over the face.
+- Settings gain the key modifier and its size, units (ft or m), the window
+  range over the face, the measured key output, the frame rate and the lens's
+  widest aperture (the last two asked once, since the camera may not report
+  them in Movie F Mode).
 - Running `balance_shot` while the coach is running is refused with a clear
   message, as two balances are today.
 
