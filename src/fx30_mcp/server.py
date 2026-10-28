@@ -20,7 +20,7 @@ from pydantic import Field
 from . import config, meter
 from .balance import balance
 from .camera import CameraBase, CameraError, GPhotoCamera
-from .coach import Coach, LightError
+from .coach import UNREACHABLE, Coach, LightError, LightUnreachable
 from .web import Broadcaster, WebHandle, start_web
 
 log = logging.getLogger(__name__)
@@ -200,7 +200,10 @@ async def set_camera(
     shutter: Annotated[str | None, Field(description="e.g. 1/50 for 24p or 25p, 1/60 for 30p")] = None,
     aperture: Annotated[str | None, Field(description="f-number, e.g. 2.8")] = None,
 ) -> dict[str, str]:
-    """Change ISO, shutter or aperture. Names must match what the camera offers; an error lists them."""
+    """Change ISO, shutter or aperture; each is read back from the camera before it is reported.
+    With the camera in M (coach_shot sets it) all three can be changed over USB; in Movie F Mode
+    shutter and ISO stay on the camera's own controls. Names must match what the camera offers;
+    an error lists them."""
 
     cam = camera()
     done = {}
@@ -458,6 +461,8 @@ async def coach_shot(
         start = _coach_task = asyncio.create_task(coach.start())
         try:
             plan = await start
+        except LightUnreachable as err:
+            raise ToolError(f"{UNREACHABLE[0]}. {UNREACHABLE[1]}") from err
         except LightError as err:
             raise ToolError(str(err)) from err
         except asyncio.CancelledError:

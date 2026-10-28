@@ -38,12 +38,14 @@ or the light's distance (half the distance is two stops more).
 | `set_face_target` | Saves the face brightness and skin colour to aim for: light it how you like, then call it with no level |
 | `match_white` | Light and camera to one colour temperature |
 | `set_lights` | The key light (on the face), the fill (on the shadow side) and the lighting ratio; with nothing given, lists the lights amaran Desktop has paired |
-| `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, recording state |
+| `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, exposure mode, recording state; set_camera reads each value back before reporting it |
 | `start_recording` / `stop_recording` | Record to the card; starting stops the coach first |
 
 ## Shot coach
 
-Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). If the camera cannot report them, also give `frame_rate` (23.976 to 60; 24p plans on a 1/50 shutter) and `widest_aperture` (the lens's widest f-number); all of these are saved. It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. You set ISO, shutter and aperture on the camera (they are read-only over USB) and the coach confirms them by readback, then walks you through placing the key, the fill and the balance until it says Ready to record.
+Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). If the camera cannot report them, also give `frame_rate` (23.976 to 60; 24p plans on a 1/50 shutter) and `widest_aperture` (the lens's widest f-number); all of these are saved. It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. The coach puts the camera in M and sets ISO, shutter and aperture itself over USB, confirming each by readback; only a setting the camera refuses is left for you to set by hand. It never writes to the camera while it is recording. Then it walks you through placing the key, the fill and the balance until it says Ready to record.
+
+The 100x S is reached over Bluetooth, and it takes one connection at a time. When a light is slow to answer the page says "Connecting to the light" (it can take up to a minute). If it cannot connect, the coach stops and says so: close the amaran or Sidus Link app on your phone, or turn off the phone's Bluetooth, then start the coach again.
 
 Without an ND filter the plan stops the lens down to f/11, then f/16, then raises the shutter through 1/125, 1/250 and 1/500, and tells you when a bright window still cannot be held. `balance_shot` refuses while the coach runs; `stop_coach` (or `start_recording`) ends it.
 
@@ -88,8 +90,11 @@ points; `set_face_target` replaces them with a look you chose.
   colour temperature (2500 to 9900K in 100K steps, read back to confirm) and
   streams 1024x576 live view. Start and stop recording work (a test left one
   clip on the card); both now wait for Sony's Movie Recording State to agree.
-- ISO, shutter and aperture come through read-only in Movie F Mode, so set them
-  on the camera. That fits the design: they stay fixed for an interview.
+- In Movie F Mode shutter and ISO come through read-only and the shutter
+  floats on Auto. The exposure mode (`expprogram`) is writable; in M (Oct 28
+  2026) shutter, ISO and aperture are all writable over USB, and recording
+  still starts and stops. Writes are taken at once but read back late (about a
+  second), so each write is confirmed by polling the readback for up to 3 s.
 - macOS's `ptpcamerad` claims the camera when it is plugged in. Opening the
   camera stops it (launchd brings it back) and retries for a few seconds.
 - Sony's Camera Remote SDK also lists the FX30, and would plug in as another

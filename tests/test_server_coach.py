@@ -343,3 +343,18 @@ def test_a_client_cancelling_coach_shot_is_a_cancel_not_a_stop(server):
         assert server._coach is None and not server._busy.locked()
 
     asyncio.run(go())
+
+
+def test_an_unreachable_light_at_the_survey_names_the_phone_app(server, monkeypatch):
+    from fx30_mcp.coach import Coach, LightUnreachable
+
+    async def fail(self):
+        raise LightUnreachable("Found the light but could not connect ()")
+
+    async def go():
+        monkeypatch.setattr(Coach, "start", fail)
+        with pytest.raises(ToolError, match=r"^The light isn't answering\. If the amaran or Sidus Link app is open on your phone"):
+            await server.coach_shot(modifier="bare")
+        assert server._coach is None and not server._busy.locked()
+
+    asyncio.run(go())
