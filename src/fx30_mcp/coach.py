@@ -1,10 +1,10 @@
 """Coach a talking-head shot, one instruction at a time.
 
 start() looks at the room with the lights off and plans the shot. run() then
-walks the steps: the camera settings on the card (ISO, shutter and aperture are
-the owner's to set, so the coach asks and checks the readback), where the key
-goes and which side it lights, the fill when there is one, then the existing
-balance loop. It ends at Ready. Every change of instruction or light goes out
+walks the steps: the camera settings on the card (the coach puts the camera in
+M and sets ISO, shutter and aperture itself, asking only for what the camera
+refuses), where the key goes and which side it lights, the fill when there is
+one, then the existing balance loop. It ends at Ready. Every change of instruction or light goes out
 through publish as one state dict, for the page.
 
 The coach never closes the camera: the server holds it, and a process that
@@ -279,10 +279,16 @@ class Coach:
     def _window_holds(self, _reading: meter.Reading) -> bool:
         return self._lights["window"] != "red"
 
-    async def _readback(self) -> dict[str, str | None]:
+    async def _settings(self) -> dict[str, Any]:
+        """What the camera reports; stops the coach if it is recording."""
+
         raw = await self.camera.settings()
         if raw.get("recording"):
             raise _Recording
+        return raw
+
+    async def _readback(self) -> dict[str, str | None]:
+        raw = await self._settings()
         return {s: _canonical(s, raw.get(s)) for s in LABELS}
 
     async def _wait(
@@ -314,18 +320,46 @@ class Coach:
         return reading
 
     async def _camera_step(self) -> None:
-        """Ask for each card setting until the readback matches; redo the card while the window is off.
+        """Set the card on the camera until the readback matches; redo the card while the window is off.
 
-        A setting the camera does not report is asked for once and taken as set when they tap."""
+        The camera goes to M first, so shutter and ISO can be written over USB. Each setting that
+        differs is written once per card value, straight after a readback that shows the camera is
+        not recording. A setting the camera refuses is asked for by hand; one it does not report is
+        asked for once and taken as set when they tap."""
 
         recomputes = 0
         tapped: dict[str, str] = {}
+        written: dict[str, str] = {}
+        by_hand: set[str] = set()
+        mode_tried = False
         while True:
             self._check()
-            current = await self._readback()
-            await self._look()
+            raw = await self._settings()
+            current = {s: _canonical(s, raw.get(s)) for s in LABELS}
             card = self.plan.camera
             wanted = {s: _canonical(s, getattr(card, s)) for s in LABELS}
+            if not mode_tried and raw.get("exposure_mode") not in (None, "M"):
+                mode_tried = True
+                self._show("camera", "Setting the camera to Manual", None)
+                try:
+                    await self.camera.set_exposure_mode("M")
+                except CameraError:
+                    by_hand |= {"shutter", "iso"}
+                continue  # read again: M has its own shutter and ISO
+            write = next(
+                (s for s in LABELS
+                 if s not in by_hand and current[s] is not None and current[s] != wanted[s] and written.get(s) != wanted[s]),
+                None,
+            )
+            if write is not None:
+                written[write] = wanted[write]
+                self._show("camera", f"Setting {wanted[write]}", LABELS[write])
+                try:
+                    await self.camera.set(write, getattr(card, write))
+                except CameraError:
+                    by_hand.add(write)
+                continue
+            await self._look()
             wrong = next(
                 (s for s in LABELS if current[s] != wanted[s] and not (current[s] is None and tapped.get(s) == wanted[s])),
                 None,

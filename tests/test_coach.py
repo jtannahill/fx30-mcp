@@ -105,7 +105,9 @@ def test_walks_to_ready():
     assert (last["instruction"], last["detail"]) == ("Ready to record", None)
     assert last["lights"]["face"] == "green"
     assert last["lights"]["ratio"] is None
-    assert not any(s["step"] == "camera" and s["screen"] == "coach" for s in states)
+    shown = [(s["instruction"], s["detail"]) for s in states if s["step"] == "camera" and s["screen"] == "coach"]
+    assert shown == [("Setting the camera to Manual", None)]
+    assert camera.exposure_mode == "M"
     assert not any(s["instruction"].startswith("Fill") for s in states)
     assert coach.running is False
 
@@ -126,32 +128,127 @@ def test_begin_before_run_is_remembered():
     assert states[-1]["step"] == "ready"
 
 
-def test_waits_for_the_camera_setting():
-    camera, key = sim()
-    coach, states = coach_for(camera, key)
-    asked = []
-
-    def set_aperture():
-        asked.append(dict(coach.state))
-        camera.values["aperture"] = SETTLED
+def run_camera_step(coach, camera, *helpers, before=None) -> None:
+    """start, change the camera with before(), then run until the key step and stop there."""
 
     async def go():
         await coach.start()
-        camera.values["aperture"] = "f/11"
+        if before is not None:
+            before()
         coach.begin()
-        tasks = [
-            asyncio.create_task(when(coach, at("camera"), set_aperture)),
-            asyncio.create_task(when(coach, at("place_key"), coach.stop)),
-        ]
-        await asyncio.wait_for(coach.run(), 30)
-        for task in tasks:
-            task.cancel()
+        tasks = [asyncio.create_task(h) for h in (*helpers, when(coach, at("place_key"), coach.stop))]
+        try:
+            await asyncio.wait_for(coach.run(), 30)
+        finally:
+            for task in tasks:
+                task.cancel()
 
     asyncio.run(go())
-    assert asked[0]["instruction"] == f"Set {SETTLED} on the camera"
-    assert asked[0]["detail"] == "Aperture"
+
+
+def camera_states(states) -> list[tuple[str, str | None]]:
+    return [(s["instruction"], s["detail"]) for s in states if s["screen"] == "coach" and s["step"] == "camera"]
+
+
+def test_sets_manual_and_writes_the_card_itself():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+
+    def owner_left_it_elsewhere():
+        camera.values.update(aperture="f/11", iso="2500")
+
+    run_camera_step(coach, camera, before=owner_left_it_elsewhere)
+    assert camera.exposure_mode == "M"
+    assert camera.values == {"iso": "800", "shutter": "1/60", "aperture": SETTLED}
+    assert camera_states(states) == [
+        ("Setting the camera to Manual", None),
+        (f"Setting {SETTLED}", "Aperture"),
+        ("Setting 800", "ISO"),
+    ]
     assert any(s["step"] == "place_key" for s in states)
-    assert states[-1]["step"] == "stopped"
+
+
+def test_already_in_manual_and_on_the_card_shows_no_camera_step():
+    camera, key = sim(exposure_mode="M")
+    coach, states = coach_for(camera, key)
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    assert states[-1]["step"] == "ready"
+    assert camera_states(states) == []
+
+
+def test_a_refused_write_falls_back_to_asking():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    real = camera.set
+
+    async def refuse_aperture(setting, value):
+        if setting == "aperture":
+            raise CameraError(f"the camera did not take aperture {value} (still f/11)")
+        return await real(setting, value)
+
+    camera.set = refuse_aperture
+
+    def owner_left_it_elsewhere():
+        camera.values["aperture"] = "f/11"
+
+    def owner_sets_it():
+        camera.values["aperture"] = SETTLED
+
+    asked = at("camera", f"Set {SETTLED} on the camera")
+    run_camera_step(coach, camera, when(coach, asked, owner_sets_it), before=owner_left_it_elsewhere)
+    assert (f"Set {SETTLED} on the camera", "Aperture") in camera_states(states)
+    assert any(s["step"] == "place_key" for s in states)
+
+
+def test_a_failed_switch_to_manual_asks_for_shutter_and_iso():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    writes = []
+    real = camera.set
+
+    async def no_manual(_mode):
+        raise CameraError("exposure_mode 'M' is not offered")
+
+    async def counting(setting, value):
+        writes.append(setting)
+        return await real(setting, value)
+
+    camera.set_exposure_mode = no_manual
+    camera.set = counting
+
+    def owner_left_it_elsewhere():
+        camera.values.update(shutter="1/30", aperture="f/11")
+
+    def owner_sets_it():
+        camera.values["shutter"] = "1/60"
+
+    asked = at("camera", "Set 1/60 on the camera")
+    run_camera_step(coach, camera, when(coach, asked, owner_sets_it), before=owner_left_it_elsewhere)
+    assert ("Set 1/60 on the camera", "Shutter") in camera_states(states)
+    assert writes == ["aperture"] and camera.values["aperture"] == SETTLED
+    assert any(s["step"] == "place_key" for s in states)
+
+
+def test_recording_started_during_the_camera_step_writes_nothing_more():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    real = camera.set_exposure_mode
+
+    async def then_record(mode):
+        await real(mode)
+        camera.recording = True  # the owner pressed record on the camera
+
+    camera.set_exposure_mode = then_record
+
+    def owner_left_it_elsewhere():
+        camera.values["aperture"] = "f/11"
+
+    run_camera_step(coach, camera, before=owner_left_it_elsewhere)
+    assert camera.values["aperture"] == "f/11"
+    assert (states[-1]["instruction"], states[-1]["detail"]) == RECORDING_SHOWN
+
+
+RECORDING_SHOWN = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
 
 
 def test_camera_readback_forms_match():
@@ -172,7 +269,7 @@ def test_camera_readback_forms_match():
         stop.cancel()
 
     asyncio.run(go())
-    assert not any(s["screen"] == "coach" and s["step"] == "camera" for s in states)
+    assert camera_states(states) == [("Setting the camera to Manual", None)]  # nothing to write
 
 
 def test_place_key_says_where():
@@ -321,16 +418,10 @@ def test_camera_card_is_redone_until_the_window_sits_right():
     key = SimLight()
     camera = SimCamera(key, gain=8.0, window=4.0)  # f/2.8: the window clips, so the card darkens a step at a time
     coach, states = coach_for(camera, key)
-
-    def follow(state: dict) -> bool:
-        if state.get("screen") == "coach" and state.get("step") == "camera":
-            card = coach.plan.camera
-            camera.values.update(iso=card.iso, shutter=card.shutter, aperture=card.aperture)
-        return state.get("step") == "place_key"
-
-    walk(coach, when(coach, follow, coach.stop))
-    asked = [s["instruction"] for s in states if s["screen"] == "coach" and s["step"] == "camera"]
-    assert len(set(asked)) >= 2
+    walk(coach, when(coach, at("place_key"), coach.stop))
+    written = [i for i, _d in camera_states(states) if i.startswith("Setting f/")]
+    assert len(set(written)) >= 2
+    assert not any(i.startswith("Set ") and i.endswith("on the camera") for i, _d in camera_states(states))
     assert camera.values["aperture"] == SETTLED
 
 
@@ -424,13 +515,14 @@ def test_window_clipping_after_balance_goes_back_to_the_camera():
         coach,
         when(coach, at("place_key"), coach.light_in_place),
         when(coach, at("balance"), brighter_sky),
-        when(coach, at("camera"), coach.stop),
+        when(coach, lambda state: at("camera")(state) and state["instruction"].startswith("Setting f/"), coach.stop),
     )
     steps = [s["step"] for s in states if s["screen"] == "coach"]
     assert "ready" not in steps
-    asked = next(s for s in states if s["screen"] == "coach" and s["step"] == "camera")
-    assert asked["instruction"].startswith("Set f/") and asked["instruction"] != f"Set {SETTLED} on the camera"
-    assert steps.index("camera") > steps.index("balance")
+    after = states[[s["step"] for s in states].index("balance"):]
+    written = next(s for s in after if s["screen"] == "coach" and s["step"] == "camera")
+    assert written["instruction"].startswith("Setting f/") and written["instruction"] != f"Setting {SETTLED}"
+    assert written["detail"] == "Aperture"
 
 
 @pytest.mark.parametrize(
@@ -609,11 +701,9 @@ def test_recording_seen_by_the_coach_stops_it():
     asyncio.run(go())
     last = states[-1]
     assert last["step"] == "stopped"
-    assert (last["instruction"], last["detail"]) == (
-        "Camera is recording",
-        "The coach stopped so it does not read the camera during a take.",
-    )
+    assert (last["instruction"], last["detail"]) == RECORDING_SHOWN
     assert frames == []
+    assert camera.exposure_mode == "Movie F Mode"
     assert coach.running is False
 
 
@@ -707,3 +797,4 @@ def test_a_dim_key_is_turned_up_before_the_key_check():
     assert not any(off(s) for s in states)
     assert (coach.plan.kelvin, 50, 0) in key.writes
     assert states[-1]["step"] == "ready"
+
