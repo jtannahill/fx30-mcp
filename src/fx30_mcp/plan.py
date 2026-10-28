@@ -105,9 +105,11 @@ def exposure_change(window: meter.Window | None, target: float, profile: str, wi
         return 0.0
     if window.clipped > 0.02:
         return -1.0  # a step, then measure again: a clipped window says nothing about how far over it is
-    aim = min(window_range[1], headroom(target, profile) - 1 / 3)
+    cap = min(window_range[1], headroom(target, profile) - 1 / 3)
     over = meter.stops_off(target, window.level, profile)
-    return aim - over
+    if min(window_range[0], cap) <= over <= cap:
+        return 0.0  # already in range: leave the camera alone
+    return cap - over
 
 
 @dataclass
@@ -178,11 +180,11 @@ def window_light(
     face_level: float,
     profile: str,
     truthful: bool,
-    window_range: list[float],
 ) -> str | None:
     """None with no window; amber when it cannot be judged or is dull or near white; red when clipping.
 
-    The top of window_range is not enforced here: a bright window that is not clipping is fine."""
+    "Dull" is under AMBER_BELOW stops over the face, or less where the profile has little headroom
+    (Rec.709). A bright window that is not clipping is fine."""
 
     if window is None:
         return None
@@ -192,7 +194,8 @@ def window_light(
         return "red"
     over = meter.stops_off(face_level, window.level, profile)
     to_clip = meter.stops_off(window.level, CLIP[profile], profile)
-    return "amber" if over < AMBER_BELOW or to_clip < 1 / 3 else "green"
+    dull = min(AMBER_BELOW, headroom(face_level, profile) - 2 / 3)
+    return "amber" if over < dull or to_clip < 1 / 3 else "green"
 
 
 @dataclass
@@ -204,6 +207,7 @@ class Plan:
     key_percent: float | None
     fill_side: str
     fill_ratio: float
+    note: str | None = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -237,6 +241,10 @@ def make_plan(survey: Survey, settings: Settings, override: str | None = None) -
         )
     card = camera_card(current, stops, frame_rate, widest, has_window)
     exposure = exposure_of(card.iso, card.shutter, card.aperture)
+    note = None
+    if has_window and survey.info.get("picture_profile") == "Off":
+        h = headroom(settings.target, "rec709")
+        note = f"Picture Profile off holds about {h:.1f} stops over your face; S-Log3 would keep more of the window."
     return Plan(
         geometry=geometry,
         why=why,
@@ -245,4 +253,5 @@ def make_plan(survey: Survey, settings: Settings, override: str | None = None) -
         key_percent=_predict_key_percent(settings, geometry.distance_ft, exposure),
         fill_side="right" if side == "left" else "left",
         fill_ratio=settings.fill_ratio,
+        note=note,
     )

@@ -101,6 +101,28 @@ def test_exposure_change():
     assert 6.0 + change <= 4.0 + 1e-6
 
 
+def test_exposure_change_leaves_a_window_in_range_alone():
+    assert exposure_change(window(level_over(0.5, 2.5, "slog3")), 0.5, "slog3", [2.0, 4.0]) == 0
+    assert exposure_change(window(level_over(0.5, 6.0, "slog3")), 0.5, "slog3", [2.0, 4.0]) < 0
+
+
+def test_window_light_in_rec709_with_little_headroom():
+    face = 0.6
+    assert window_light(window(level_over(face, 1.0, "rec709")), face, "rec709", True) == "green"
+    assert window_light(window(level_over(face, 0.3, "rec709")), face, "rec709", True) == "amber"
+
+
+def test_plan_note_when_picture_profile_is_off():
+    survey_ = sim_survey()
+    assert make_plan(survey_, Settings()).note is None
+    survey_.info["picture_profile"] = "Off"
+    expected = f"Picture Profile off holds about {headroom(Settings().target, 'rec709'):.1f} stops over your face; S-Log3 would keep more of the window."
+    assert make_plan(survey_, Settings()).note == expected
+    assert make_plan(survey_, Settings()).to_json()["note"] == expected
+    survey_.window = None
+    assert make_plan(survey_, Settings()).note is None
+
+
 def test_exposure_change_brightens_a_dull_window():
     dull = window(level=level_over(0.5, 1.0, "slog3"))
     assert exposure_change(dull, 0.5, "slog3", [2.0, 4.0]) > 0
@@ -170,12 +192,11 @@ def test_ratio_light(contrast, light):
 
 def test_window_light():
     face = 0.5
-    rng = [2.0, 4.0]
-    assert window_light(None, face, "slog3", True, rng) is None
-    assert window_light(window(level_over(face, 3, "slog3")), face, "slog3", False, rng) == "amber"
-    assert window_light(window(0.99, clipped=0.3), face, "slog3", True, rng) == "red"
-    assert window_light(window(level_over(face, 1.0, "slog3")), face, "slog3", True, rng) == "amber"
-    assert window_light(window(level_over(face, 3.0, "slog3")), face, "slog3", True, rng) == "green"
+    assert window_light(None, face, "slog3", True) is None
+    assert window_light(window(level_over(face, 3, "slog3")), face, "slog3", False) == "amber"
+    assert window_light(window(0.99, clipped=0.3), face, "slog3", True) == "red"
+    assert window_light(window(level_over(face, 1.0, "slog3")), face, "slog3", True) == "amber"
+    assert window_light(window(level_over(face, 3.0, "slog3")), face, "slog3", True) == "green"
 
 
 def sim_survey():
