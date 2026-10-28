@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 import json
 import os
 from pathlib import Path
@@ -25,6 +25,12 @@ class Settings:
     key_light: str | None = None  # the light balance_shot steers, by its amaran name; None: amaran-mcp's light
     fill_light: str | None = None  # the light on the shadow side, by its amaran name; None: no fill
     fill_ratio: float = 1.0  # stops from the lit to the shadow side: 1 is 2:1, 2 is 4:1
+    key_modifier: str | None = None  # on the key: bare, reflector, softbox, lantern or umbrella
+    key_size_in: float | None = None  # its diameter or width in inches, when it has one
+    window_range: list[float] = field(default_factory=lambda: [2.0, 4.0])  # stops the window sits over the face
+    frame_rate: float | None = None  # asked once, since the camera may not report it
+    widest_aperture: float | None = None  # the lens's widest f-number, asked once
+    key_output: dict | None = None  # measured by the coach: modifier, distance_ft, stops_at_full, exposure
 
     @property
     def target(self) -> float:
