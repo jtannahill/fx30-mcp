@@ -55,7 +55,7 @@ def choose_key_side(
         if abs(meter.stops_off(min(ambient), max(ambient), profile)) > UNEVEN_STOPS:
             lit = "left" if left > right else "right"
             other = "right" if lit == "left" else "left"
-            why = f"The window already lights your {lit} cheek, so the key goes on the other side to give your face shape."
+            why = f"The window already lights the camera-{lit} side of your face, so the key goes on the other side to give your face shape."
             return other, why
     return "left", "Nothing in the room favours a side, so the key goes camera-left."
 

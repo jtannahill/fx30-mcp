@@ -27,6 +27,7 @@ from .coach import Coach
 
 PAGE = Path(__file__).parent / "static" / "coach.html"
 COOKIE = "fx30_key"
+NO_REFERRER = {"Referrer-Policy": "no-referrer"}
 
 
 class Broadcaster:
@@ -63,9 +64,11 @@ def make_app(coach: Coach, key: str, broadcaster: Broadcaster) -> Starlette:
     def guarded(handler):
         async def route(request: Request) -> Response:
             if not allowed(request):
-                return Response("Open the link Claude gave you.", status_code=403)
+                return Response("Open the link Claude gave you.", status_code=403, headers=NO_REFERRER)
             response = await handler(request)
-            if request.query_params.get("key") and not request.cookies.get(COOKIE):
+            response.headers["Referrer-Policy"] = "no-referrer"
+            # A stale cookie from an earlier coach (new key, same host) must be replaced.
+            if request.cookies.get(COOKIE) != key and request.query_params.get("key") == key:
                 response.set_cookie(COOKIE, key, httponly=True, samesite="lax")
             return response
 

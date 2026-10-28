@@ -224,13 +224,16 @@ class Coach:
             raise _Stopped
 
     def _show(self, step: str, instruction: str, detail: str | None, screen: str = "coach") -> None:
+        plan = self.plan.to_json() if self.plan else None
+        if plan is not None:
+            plan["has_fill"] = self.fill is not None
         state = {
             "screen": screen,
             "step": step,
             "instruction": instruction,
             "detail": detail,
             "lights": dict(self._lights),
-            "plan": self.plan.to_json() if self.plan else None,
+            "plan": plan,
         }
         if state != self.state:
             self.state = state

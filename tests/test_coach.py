@@ -92,7 +92,7 @@ def test_start_publishes_the_plan():
     plan = asyncio.run(coach.start())
     assert plan.camera.aperture == SETTLED
     assert states[-1]["screen"] == "plan"
-    assert states[-1]["plan"] == plan.to_json()
+    assert states[-1]["plan"] == {**plan.to_json(), "has_fill": False}
     assert coach.latest_frame is not None
 
 

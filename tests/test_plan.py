@@ -253,3 +253,8 @@ def test_make_plan_predicts_key_percent_from_the_recorded_output():
         key_output={"modifier": "softbox", "distance_ft": 2.5, "stops_at_full": -3.0, "exposure": exposure},
     )
     assert make_plan(survey_, dim).key_percent == 100
+
+
+def test_why_names_the_camera_side_not_the_cheek():
+    _side, why = choose_key_side(None, (3.0, 1.0), "rec709", None)
+    assert "camera-left side of your face" in why and "cheek" not in why

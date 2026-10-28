@@ -47,7 +47,7 @@
   <h1 id="plan-title">Shot coach</h1>
   <p class="lead" id="plan-detail"></p>
   <div class="plan-grid" id="plan-body">
-    <svg id="top" viewBox="0 0 420 380" width="420" height="380" role="img" aria-label="Top-down plan"></svg>
+    <svg id="top" viewBox="-20 0 460 380" width="460" height="380" role="img" aria-label="Top-down plan"></svg>
     <div class="side">
       <svg id="sideview" viewBox="0 0 260 130" width="260" height="130" role="img" aria-label="Side view"></svg>
       <div class="label">Set on the camera</div>
@@ -110,16 +110,18 @@ function drawTop(plan, hasWindow) {
   // Frame-left is camera-left, so the left key sits at smaller x.
   const dir = g.side === "left" ? -1 : 1;
   const angle = g.angle_deg * Math.PI / 180;
-  const reach = Math.min(g.distance_ft * 40, 170);
+  const reach = Math.min(g.distance_ft * 30, 150);
   const kx = 210 + dir * Math.sin(angle) * reach, ky = 140 + Math.cos(angle) * reach;
   svg(root, "path", { d: `M210 140 L${kx} ${ky}`, stroke: "#b8690a", "stroke-width": 2, "stroke-dasharray": "3 3" });
   const spin = Math.atan2(210 - kx, ky - 140) * -180 / Math.PI;
   svg(root, "rect", { x: kx - 20, y: ky - 13, width: 40, height: 26, rx: 4, fill: "#e08a1e", transform: `rotate(${spin} ${kx} ${ky})` });
-  const lx = dir < 0 ? Math.max(kx - 150, 6) : Math.min(kx + 26, 250);
-  svg(root, "text", { x: lx, y: ky - 22, "font-size": 13, "font-weight": 700, fill: "#8a4f05" }, "KEY");
-  svg(root, "text", { x: lx, y: ky - 7, "font-size": 12, fill: "#8a4f05" }, `camera-${g.side}, ${fmtFt(g.distance_ft)}`);
-  svg(root, "text", { x: 214, y: 280, "font-size": 12, fill: "#8a4f05" }, `${g.angle_deg} deg off axis`);
+  const lx = dir < 0 ? kx - 26 : kx + 26, anchor = dir < 0 ? "end" : "start";
+  svg(root, "text", { x: lx, y: ky - 6, "font-size": 13, "font-weight": 700, "text-anchor": anchor, fill: "#8a4f05" }, "KEY");
+  svg(root, "text", { x: lx, y: ky + 9, "font-size": 12, "text-anchor": anchor, fill: "#8a4f05" }, `camera-${g.side}, ${fmtFt(g.distance_ft)}`);
+  // The angle sits outside the key's beam on its own side, well above the fill by the lens.
+  svg(root, "text", { x: 210 + dir * (Math.tan(angle) * 40 + 8), y: 180, "font-size": 12, "text-anchor": anchor, fill: "#8a4f05" }, `${g.angle_deg} deg off axis`);
 
+  if (!plan.has_fill) return;
   const fx = 210 - dir * 40;
   svg(root, "rect", { x: fx - 15, y: 296, width: 30, height: 10, rx: 3, fill: "#7a8fd6" });
   const fl = dir < 0 ? fx + 22 : fx - 22;
@@ -140,6 +142,7 @@ function drawSide(plan) {
 }
 
 function showPlan(s) {
+  stopThumb();
   $("plan").hidden = false; $("coach").hidden = true;
   $("plan-title").textContent = s.instruction;
   $("plan-detail").textContent = s.detail || "";
@@ -158,6 +161,9 @@ function showPlan(s) {
 }
 
 let thumbTimer = null;
+function stopThumb() {
+  clearInterval(thumbTimer); thumbTimer = null;
+}
 function refreshThumb() {
   const img = $("thumb");
   img.onload = () => { img.hidden = false; };

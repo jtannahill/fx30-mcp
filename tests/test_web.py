@@ -87,3 +87,43 @@ def test_qr_encodes_the_url():
             await handle.close()
 
     asyncio.run(go())
+
+
+def test_stale_cookie_is_replaced_by_the_key_in_the_link():
+    coach, broadcaster = build()
+    client = TestClient(make_app(coach, "k", broadcaster), cookies={"fx30_key": "old"})
+    assert client.get("/frame.jpg").status_code == 403
+    first = client.get("/?key=k")
+    assert first.status_code == 200
+    assert "fx30_key=k" in first.headers["set-cookie"]
+    assert client.get("/frame.jpg").status_code in (200, 204)
+
+
+def test_every_response_sends_no_referrer():
+    coach, broadcaster = build()
+    client = TestClient(make_app(coach, "k", broadcaster))
+    assert client.get("/").headers["referrer-policy"] == "no-referrer"
+    assert client.get("/?key=k").headers["referrer-policy"] == "no-referrer"
+
+
+def test_published_plan_says_whether_there_is_a_fill():
+    import asyncio as aio
+    from fx30_mcp import config, meter
+
+    async def go(fill):
+        key = SimLight()
+        states = []
+        coach = Coach(SimCamera(key, window=4.0), key, fill, Settings(), states.append, sleep=lambda _s: aio.sleep(0))
+        await coach.start()
+        return states[-1]["plan"]["has_fill"]
+
+    import pytest
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(meter, "find_face", lambda _j: (100 / 320, 40 / 180, 120 / 320, 100 / 180))
+    mp.setattr(meter, "face_yaw", lambda _j: None)
+    try:
+        assert asyncio.run(go(None)) is False
+        assert asyncio.run(go(SimLight())) is True
+    finally:
+        mp.undo()
