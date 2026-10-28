@@ -31,15 +31,17 @@ SETTING_NAMES = {
     "kelvin": ["colortemperature"],
 }
 
-# Candidate names for what describe() reports. Unknown names read as None, so a
-# wrong guess is harmless. Only the names confirmed on the camera are known to
-# work; the rest are guesses until checked with `fx30-mcp props`.
+# Where describe() reads from. Verified on the real FX30 on Oct 28 2026 (found by
+# label): d241 File Format Movie, d242 Recording Setting Movie, d23f Picture
+# Profile (read-only). The FX30 has no frame rate, gamma or display assist
+# property over USB, so those lists are empty and read as None.
 INFO_NAMES = {
-    "frame_rate": ["movieframerate", "recordingframerate", "moviefps"],
-    "file_format": ["movierecordsetting", "movieformat", "fileformat"],
-    "picture_profile": ["pictureprofile"],
-    "gamma": ["gamma"],
-    "display_assist": ["gammadisplayassist"],
+    "frame_rate": [],
+    "file_format": ["d241"],
+    "recording_setting": ["d242"],
+    "picture_profile": ["d23f"],
+    "gamma": [],
+    "display_assist": [],
 }
 
 
@@ -79,6 +81,9 @@ class CameraBase:
     backend: str
 
     async def settings(self) -> dict[str, Any]: ...
+    async def config_entries(self, needle: str = "") -> list[tuple[str, str, str]]:
+        return await self._run(self._config_entries, needle)
+
     async def describe(self) -> dict[str, Any]: ...
     async def set(self, setting: str, value: str) -> str: ...
     async def set_kelvin(self, kelvin: int) -> None: ...
@@ -212,15 +217,39 @@ class GPhotoCamera(CameraBase):
                     break
                 except gp.GPhoto2Error:
                     continue
+        profile = raw["picture_profile"]
+        if profile is None:
+            picture_profile = None
+        else:
+            picture_profile = "Off" if str(profile) == "0" else f"PP code {profile}"
         return {
             "frame_rate": fps_from(raw["frame_rate"]) or fps_from(raw["file_format"]),
             "file_format": raw["file_format"],
-            "picture_profile": raw["picture_profile"],
-            "gamma": raw["gamma"],
+            "recording_setting": raw["recording_setting"],
+            "picture_profile": picture_profile,
+            "gamma": raw["gamma"] or ("Rec709" if picture_profile == "Off" else None),
             "display_assist": _flag(raw["display_assist"]),
             "apertures": self._choices("aperture"),
             "shutters": self._choices("shutter"),
         }
+
+    def _config_entries(self, needle: str) -> list[tuple[str, str, str]]:
+        """(name, label, value) for each config whose name or label contains needle,
+        read one get_single_config at a time."""
+
+        import gphoto2 as gp
+
+        names = self._camera.list_config()
+        out = []
+        for name in (names.get_name(i) for i in range(names.count())):
+            try:
+                widget = self._camera.get_single_config(name)
+                label, value = widget.get_label(), str(widget.get_value())
+            except gp.GPhoto2Error as err:
+                label, value = "", f"({err})"
+            if needle.lower() in f"{name} {label}".lower():
+                out.append((name, label, value))
+        return out
 
     def _write(self, setting: str, value: str) -> str:
         import gphoto2 as gp

@@ -2,7 +2,7 @@
 
   fx30-mcp serve   run the MCP server (stdio)
   fx30-mcp check   connect to the camera, print its settings and meter one frame
-  fx30-mcp props [filter]   print camera config values whose name contains the filter
+  fx30-mcp props [filter]   print camera config values whose name or label contains the filter
 """
 
 from __future__ import annotations
@@ -36,14 +36,8 @@ async def _props(needle: str) -> int:
 
     cam = GPhotoCamera()
     try:
-        # One name at a time: reading the whole config tree has crashed libgphoto2.
-        names = await cam._run(lambda: [n for n in cam._camera.list_config() if needle.lower() in n.lower()])
-        for name in names:
-            try:
-                value = await cam._run(lambda n=name: cam._camera.get_single_config(n).get_value())
-            except CameraError as err:
-                value = f"({err})"
-            print(f"{name} = {value}")
+        for name, label, value in await cam.config_entries(needle):
+            print(f"{name} [{label}] = {value}")
     except CameraError as err:
         print(err, file=sys.stderr)
         return 1

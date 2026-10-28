@@ -159,6 +159,7 @@ class SimCamera(CameraBase):
         return {
             "frame_rate": 29.97,
             "file_format": "XAVC S 4K",
+            "recording_setting": "52",
             "picture_profile": "PP8",
             "gamma": "S-Log3",
             "display_assist": False,
