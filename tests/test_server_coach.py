@@ -298,3 +298,35 @@ def test_coach_shot_refuses_while_the_camera_records(server):
         await server.stop_recording()
 
     asyncio.run(go())
+
+
+def test_coach_shot_saves_frame_rate_and_widest_aperture(server):
+    async def go():
+        try:
+            await server.coach_shot(modifier="bare", frame_rate=23.976, widest_aperture=4.0)
+            saved = config.load()
+            assert (saved.frame_rate, saved.widest_aperture) == (23.976, 4.0)
+        finally:
+            await server.stop_coach()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"frame_rate": 120.0}, "frame_rate"),
+        ({"frame_rate": 12.0}, "frame_rate"),
+        ({"widest_aperture": 0.5}, "widest_aperture"),
+        ({"widest_aperture": 32.0}, "widest_aperture"),
+    ],
+)
+def test_coach_shot_checks_frame_rate_and_widest_aperture(server, kwargs, match):
+    async def go():
+        with pytest.raises(ToolError, match=match):
+            await server.coach_shot(modifier="bare", **kwargs)
+        saved = config.load()
+        assert (saved.frame_rate, saved.widest_aperture) == (None, None)
+        assert not server._busy.locked()
+
+    asyncio.run(go())

@@ -18,11 +18,11 @@ CLIP = {"rec709": 0.97, "slog3": 0.94}  # where a level counts as white
 AMBER_BELOW = 1.5  # a window under this many stops over the face reads as a dull grey backdrop
 MIN_KEY_FT = 1.5  # closer than this the key is impractical
 APERTURES = [2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0]
-SHUTTERS = ["1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500"]
+SHUTTERS = ["1/50", "1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500"]
 STOP_APERTURE = APERTURES.index(16.0)  # stop down this far before raising the shutter
 TURNED_DEGREES = 15
 UNEVEN_STOPS = 1 / 3
-ND_NOTE = "Shutter above 1/60 makes motion a little crisper. A variable ND would bring it back to 1/60."
+ND_NOTE = "Shutter above {base} makes motion a little crisper. A variable ND would bring it back to {base}."
 
 
 def exposure_of(iso: str, shutter: str, aperture: str) -> float:
@@ -155,7 +155,7 @@ def camera_card(current: dict[str, Any], stops: float, frame_rate: float, widest
         aperture = max(open_limit, wanted)
         if not has_window and wanted < open_limit - 3 and aperture == open_limit:
             iso = "2500"
-    note = ND_NOTE if shutter > base else None
+    note = ND_NOTE.format(base=SHUTTERS[base]) if shutter > base else None
     return CameraCard(iso, SHUTTERS[shutter], f"f/{APERTURES[aperture]:g}", note)
 
 
@@ -227,12 +227,23 @@ def _predict_key_percent(settings: Settings, distance_ft: float, exposure: float
     return float(round(min(100.0, max(1.0, 100 * 2 ** (-stops)))))
 
 
+def _widest_offered(apertures: list[Any]) -> float | None:
+    """The smallest f-number the camera offers; choices that are not numbers are skipped."""
+
+    numbers = []
+    for choice in apertures:
+        try:
+            numbers.append(float(str(choice).lstrip("fF/")))
+        except ValueError:
+            pass
+    return min(numbers, default=None)
+
+
 def make_plan(survey: Survey, settings: Settings, override: str | None = None) -> Plan:
     side, why = choose_key_side(survey.yaw, survey.ambient, settings.profile, override)
     geometry = key_geometry(side, settings.key_modifier, settings.key_size_in)
     frame_rate = survey.info.get("frame_rate") or settings.frame_rate or 29.97
-    apertures = survey.info.get("apertures")
-    lens = float(str(apertures[0]).lstrip("fF/")) if apertures else None
+    lens = _widest_offered(survey.info.get("apertures") or [])
     widest = settings.widest_aperture or lens or 2.8
     stops = exposure_change(survey.window, settings.target, settings.profile, settings.window_range)
     has_window = survey.window is not None

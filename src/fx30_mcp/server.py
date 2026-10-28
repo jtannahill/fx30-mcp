@@ -37,6 +37,8 @@ _coach_task: asyncio.Task | None = None  # the survey while starting, then Coach
 _holds_busy = False  # True while the coach (not a balance) holds _busy
 MODIFIERS = ("bare", "reflector", "softbox", "lantern", "umbrella")
 SIZED = ("softbox", "lantern", "umbrella")
+FRAME_RATES = (23.976, 60.0)
+APERTURE_RANGE = (0.95, 22.0)
 
 
 def camera() -> CameraBase:
@@ -404,6 +406,8 @@ async def coach_shot(
     key_side: Annotated[str | None, Field(description="left or right: which side of the face the key lights; leave out to let the coach choose")] = None,
     modifier: Annotated[str | None, Field(description="What is on the 100x S: bare, reflector, softbox, lantern or umbrella; saved")] = None,
     size_in: Annotated[float | None, Field(gt=0, description="Its size in inches (softbox, lantern, umbrella); saved")] = None,
+    frame_rate: Annotated[float | None, Field(ge=FRAME_RATES[0], le=FRAME_RATES[1], description="Frames per second the camera records, e.g. 23.976 or 29.97, when it cannot say; saved")] = None,
+    widest_aperture: Annotated[float | None, Field(ge=APERTURE_RANGE[0], le=APERTURE_RANGE[1], description="The lens's widest f-number, e.g. 2.8, when the camera cannot say; saved")] = None,
 ) -> list[Image | TextContent]:
     """Plan the shot and coach the user through it from a page on their phone: camera settings,
     where the key and fill go, then the balance. Returns a QR code and the link; the plan is in
@@ -414,6 +418,10 @@ async def coach_shot(
         raise ToolError("key_side must be left or right")
     if modifier is not None and modifier not in MODIFIERS:
         raise ToolError(f"modifier must be one of {', '.join(MODIFIERS)}")
+    if frame_rate is not None and not FRAME_RATES[0] <= frame_rate <= FRAME_RATES[1]:
+        raise ToolError(f"frame_rate must be from {FRAME_RATES[0]:g} to {FRAME_RATES[1]:g}")
+    if widest_aperture is not None and not APERTURE_RANGE[0] <= widest_aperture <= APERTURE_RANGE[1]:
+        raise ToolError(f"widest_aperture must be from {APERTURE_RANGE[0]:g} to {APERTURE_RANGE[1]:g}")
     if _coach_task is not None and not _coach_task.done():
         raise ToolError("a balance or the shot coach is already running")
     await _end_coach()  # a coach that finished still has its page up
@@ -429,8 +437,12 @@ async def coach_shot(
                         "Give its size in inches for a softbox, lantern or umbrella.")
     if new_modifier in SIZED and not new_size:
         raise ToolError(f"How wide is the {new_modifier} in inches? Call coach_shot again with size_in.")
-    if (new_modifier, new_size) != (settings.key_modifier, settings.key_size_in):
+    new_rate = settings.frame_rate if frame_rate is None else frame_rate
+    new_widest = settings.widest_aperture if widest_aperture is None else widest_aperture
+    known = (settings.key_modifier, settings.key_size_in, settings.frame_rate, settings.widest_aperture)
+    if (new_modifier, new_size, new_rate, new_widest) != known:
         settings.key_modifier, settings.key_size_in = new_modifier, new_size
+        settings.frame_rate, settings.widest_aperture = new_rate, new_widest
         config.save(settings)
     broadcaster = Broadcaster()
     coach = Coach(camera(), light(), fill_light(), settings, broadcaster.publish, override=key_side)

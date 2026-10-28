@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import math
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from fx30_mcp import meter
 from fx30_mcp.config import Settings
 from fx30_mcp.plan import (
+    SHUTTERS,
     camera_card,
     choose_key_side,
     closer,
@@ -274,3 +276,31 @@ def test_make_plan_predicts_key_percent_from_the_recorded_output():
 def test_why_names_the_camera_side_not_the_cheek():
     _side, why = choose_key_side(None, (3.0, 1.0), "rec709", None)
     assert "camera-left side of your face" in why and "cheek" not in why
+
+
+def test_shutters_include_the_24p_base_in_order():
+    assert SHUTTERS[:3] == ["1/50", "1/60", "1/80"]
+
+
+def test_camera_card_at_24p_bases_on_1_50():
+    card = camera_card(current("f/2.8", "1/50"), -2, 23.976, 2.8, True)
+    assert (card.aperture, card.shutter, card.note) == ("f/5.6", "1/50", None)
+    back = camera_card(current("f/16", "1/250"), 3, 23.976, 2.8, True)
+    assert back.shutter == "1/50"
+    fast = camera_card(current("f/16", "1/100"), 0, 23.976, 2.8, True)
+    assert fast.shutter == "1/100" and "1/50" in fast.note
+
+
+def no_window_survey(info):
+    return dataclasses.replace(sim_survey(), window=None, info=info)
+
+
+def test_make_plan_uses_the_saved_frame_rate_when_the_camera_cannot_say():
+    plan = make_plan(no_window_survey({"frame_rate": None}), Settings(frame_rate=23.976))
+    assert plan.camera.shutter == "1/50"
+    assert make_plan(no_window_survey({"frame_rate": None}), Settings()).camera.shutter == "1/60"
+
+
+def test_make_plan_takes_the_widest_aperture_from_the_smallest_f_number():
+    info = {"apertures": ["f/22", "f/16", "f/8", "Unknown value 0000", "f/4", "f/5.6"]}
+    assert make_plan(no_window_survey(info), Settings()).camera.aperture == "f/4"
