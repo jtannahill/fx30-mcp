@@ -29,6 +29,7 @@ SETTING_NAMES = {
     "aperture": ["f-number", "aperture"],
     "white_balance": ["whitebalance"],
     "kelvin": ["colortemperature"],
+    "exposure_mode": ["expprogram"],  # "M" lets shutter and ISO be set over USB; "Movie F Mode" does not
 }
 
 # Where describe() reads from. Verified on the real FX30 on Oct 28 2026 (found by
@@ -71,9 +72,23 @@ WEDGED_HINT = (
 # Sony's "Movie Recording State" property; libgphoto2 has no name for it.
 RECORDING_STATE = "d21d"
 
+# The FX30 takes a write at once but reads back the old value for about a second.
+CONFIRM_SECONDS = 3.0
+CONFIRM_POLL = 0.25
+MODE_SETTLE = 0.5  # a write straight after a mode change is ignored
+
 
 class CameraError(Exception):
     pass
+
+
+def read_only(setting: str, now: Any) -> CameraError:
+    """What the camera says when a mode keeps a setting on its own controls."""
+
+    return CameraError(
+        f"the camera keeps {setting} on its own controls in this mode "
+        f"(now {now}); change it on the camera"
+    )
 
 
 class CameraBase:
@@ -86,6 +101,7 @@ class CameraBase:
 
     async def describe(self) -> dict[str, Any]: ...
     async def set(self, setting: str, value: str) -> str: ...
+    async def set_exposure_mode(self, mode: str) -> None: ...
     async def set_kelvin(self, kelvin: int) -> None: ...
     async def frame(self) -> bytes: ...
     async def record(self, on: bool) -> None: ...
@@ -289,10 +305,7 @@ class GPhotoCamera(CameraBase):
 
         name, widget = self._widget(setting)
         if widget.get_readonly():
-            raise CameraError(
-                f"the camera keeps {setting} on its own controls in this mode "
-                f"(now {widget.get_value()}); change it on the camera"
-            )
+            raise read_only(setting, widget.get_value())
         if widget.get_type() in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
             choices = [widget.get_choice(i) for i in range(widget.count_choices())]
             match = next((c for c in choices if c.lower() == value.lower()), None)
@@ -305,6 +318,25 @@ class GPhotoCamera(CameraBase):
         self._camera.set_single_config(name, widget)
         return value
 
+    def _set(self, setting: str, value: str) -> str:
+        """Write a setting and wait until the camera reads it back."""
+
+        value = self._write(setting, value)
+        deadline = time.monotonic() + CONFIRM_SECONDS
+        while True:
+            current = self._widget(setting)[1].get_value()
+            if str(current) == str(value):
+                return value
+            if time.monotonic() > deadline:
+                raise CameraError(f"the camera did not take {setting} {value} (still {current})")
+            time.sleep(CONFIRM_POLL)
+
+    def _set_exposure_mode(self, mode: str) -> None:
+        if self._widget("exposure_mode")[1].get_value() == mode:
+            return
+        self._set("exposure_mode", mode)
+        time.sleep(MODE_SETTLE)
+
     def _set_kelvin(self, kelvin: int) -> None:
         import gphoto2 as gp
 
@@ -315,7 +347,7 @@ class GPhotoCamera(CameraBase):
             raise CameraError(f"no colour temperature white balance offered; choices: {', '.join(choices)}")
         if widget.get_value() != manual:
             self._write("white_balance", manual)
-            time.sleep(0.5)  # a write straight after a mode change is ignored
+            time.sleep(MODE_SETTLE)
         name, widget = self._widget("kelvin")
         if widget.get_type() in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
             self._write("kelvin", min(
@@ -383,7 +415,10 @@ class GPhotoCamera(CameraBase):
         return await self._run(self._info)
 
     async def set(self, setting: str, value: str) -> str:
-        return await self._run(self._write, setting, value)
+        return await self._run(self._set, setting, value)
+
+    async def set_exposure_mode(self, mode: str) -> None:
+        await self._run(self._set_exposure_mode, mode)
 
     async def set_kelvin(self, kelvin: int) -> None:
         await self._run(self._set_kelvin, kelvin)

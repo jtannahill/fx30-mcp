@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .camera import CameraBase
+from .camera import CameraBase, CameraError, read_only
 from .meter import PROFILES
 
 SKIN = np.array([0.75, 0.41, 0.26])  # linear RGB of a light skin tone under even white light
@@ -69,6 +69,7 @@ class SimLight:
 
 APERTURES = ["f/2.8", "f/3.2", "f/3.5", "f/4", "f/4.5", "f/5", "f/5.6", "f/6.3", "f/7.1", "f/8", "f/9",
              "f/10", "f/11", "f/13", "f/14", "f/16", "f/18", "f/20", "f/22"]
+EXPOSURE_MODES = ["Intelligent Auto", "P", "A", "S", "M", "Movie F Mode", "S&Q F Mode"]
 SHUTTERS = ["1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500"]
 
 
@@ -95,6 +96,7 @@ class SimCamera(CameraBase):
         iso: str = "800",
         shutter: str = "1/60",
         aperture: str = "f/2.8",
+        exposure_mode: str = "Movie F Mode",  # as the FX30 came: shutter and ISO stay on its own controls
     ) -> None:
         self.name = "pretend camera"
         self.light = light
@@ -115,6 +117,7 @@ class SimCamera(CameraBase):
         self.kelvin: int | None = None
         self.recording = False
         self.values: dict[str, Any] = {"iso": iso, "shutter": shutter, "aperture": aperture}
+        self.exposure_mode = exposure_mode
 
     def _output(self, light: SimLight | None, gain: float) -> float:
         if light is None or not light.state.power:
@@ -153,7 +156,7 @@ class SimCamera(CameraBase):
         return out.getvalue()
 
     async def settings(self) -> dict[str, Any]:
-        return {**self.values, "kelvin": self.kelvin, "recording": self.recording}
+        return {**self.values, "kelvin": self.kelvin, "exposure_mode": self.exposure_mode, "recording": self.recording}
 
     async def describe(self) -> dict[str, Any]:
         return {
@@ -168,8 +171,15 @@ class SimCamera(CameraBase):
         }
 
     async def set(self, setting: str, value: str) -> str:
+        if setting in ("shutter", "iso") and self.exposure_mode != "M":
+            raise read_only(setting, self.values[setting])
         self.values[setting] = value
         return value
+
+    async def set_exposure_mode(self, mode: str) -> None:
+        if mode not in EXPOSURE_MODES:
+            raise CameraError(f"exposure_mode {mode!r} is not offered; choices: {', '.join(EXPOSURE_MODES)}")
+        self.exposure_mode = mode
 
     async def set_kelvin(self, kelvin: int) -> None:
         self.kelvin = kelvin
