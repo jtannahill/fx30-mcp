@@ -4,12 +4,15 @@ The camera renders a flat skin-coloured face lit by the pretend light: brighter
 with brightness (along a curve, as real dimmers are), greener or more magenta
 with tint and with a green cast from the "room". With key_spill below 1 the key
 lights the left half of the face more than the right, which a fill light lifts.
+A window, room ambient light, the key's side and distance, and the camera's own
+exposure (ISO, shutter, aperture) shape the rest of the scene.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import io
+import math
 from typing import Any
 
 import numpy as np
@@ -54,6 +57,9 @@ class SimLight:
         self.state.tint = tint
         self.writes.append((kelvin, self.state.brightness, tint))
 
+    def set_power(self, on: bool) -> None:
+        self.state.power = on
+
     async def set_brightness(self, percent: float) -> None:
         self.state.brightness = percent
 
@@ -74,7 +80,16 @@ class SimCamera(CameraBase):
         tint_sign: int = 1,  # +1: a higher tint is greener
         fill: SimLight | None = None,
         fill_gain: float = 1.0,
-        key_spill: float = 1.0,  # share of the key reaching the right half of the face
+        key_spill: float = 1.0,  # share of the key reaching the half of the face away from the key
+        window: float = 0.0,  # linear level of a window at the right of the frame, 0 for none
+        ambient: float = 0.0,  # room light on the face, mostly on the rim_side half
+        rim_side: str = "right",
+        key_side: str = "left",
+        key_distance_ft: float = 3.0,
+        yaw: float = 0.0,  # which way the face is turned, degrees, read by tests
+        iso: str = "800",
+        shutter: str = "1/60",
+        aperture: str = "f/2.8",
     ) -> None:
         self.name = "pretend camera"
         self.light = light
@@ -86,24 +101,47 @@ class SimCamera(CameraBase):
         self.fill = fill
         self.fill_gain = fill_gain
         self.key_spill = key_spill
+        self.window = window
+        self.ambient = ambient
+        self.rim_side = rim_side
+        self.key_side = key_side
+        self.key_distance_ft = key_distance_ft
+        self.yaw = yaw
         self.kelvin: int | None = None
         self.recording = False
-        self.values: dict[str, Any] = {"iso": "800", "shutter": "1/50", "aperture": "f/2.8"}
+        self.values: dict[str, Any] = {"iso": iso, "shutter": shutter, "aperture": aperture}
 
     def _output(self, light: SimLight | None, gain: float) -> float:
         if light is None or not light.state.power:
             return 0.0
         return gain * ((light.state.brightness or 0) / 100) ** self.curve
 
+    def exposure_stops(self) -> float:
+        """Stops of exposure relative to ISO 800, 1/60, f/2.8."""
+
+        iso = float(self.values["iso"])
+        shutter = self.values["shutter"]
+        seconds = float(shutter.split("/")[1]) ** -1 if "/" in shutter else float(shutter.strip('"'))
+        f_number = float(self.values["aperture"].lstrip("fF/"))
+        return math.log2(iso / 800) + math.log2(seconds * 60) - 2 * math.log2(f_number / 2.8)
+
     def render(self) -> bytes:
-        key = self._output(self.light, self.gain)
+        scale = 2 ** self.exposure_stops()
+        key = self._output(self.light, self.gain) * (3.0 / self.key_distance_ft) ** 2
         fill = self._output(self.fill, self.fill_gain)
         green = 1 + self.green_cast + 0.02 * (self.light.state.tint or 0) * self.tint_sign
         tone = SKIN * np.array([1.0, green, 1.0])
         encode = PROFILES[self.profile][1]
-        frame = np.full((180, 320, 3), float(encode(np.array(0.02 * key))))
-        frame[40:140, 100:160] = encode(np.clip(tone * (key + 0.1 * fill), 0, 1.2))
-        frame[40:140, 160:220] = encode(np.clip(tone * (key * self.key_spill + fill), 0, 1.2))
+        rim = {"left": (1.0, 0.3), "right": (0.3, 1.0)}[self.rim_side]
+        lit_left = self.key_side == "left"
+        key_halves = (key, key * self.key_spill) if lit_left else (key * self.key_spill, key)
+        fill_halves = (0.1 * fill, fill) if lit_left else (fill, 0.1 * fill)
+        frame = np.full((180, 320, 3), float(encode(np.array(0.02 * key * scale))))
+        if self.window:
+            frame[0:140, 250:320] = encode(np.array(self.window * scale))
+        for x, half in ((100, 0), (160, 1)):
+            level = (key_halves[half] + fill_halves[half] + self.ambient * rim[half]) * scale
+            frame[40:140, x : x + 60] = encode(np.clip(tone * level, 0, 1.2))
         pixels = (np.clip(frame, 0, 1) * 255).round().astype(np.uint8)
         out = io.BytesIO()
         Image.fromarray(pixels).save(out, "JPEG", quality=95)
