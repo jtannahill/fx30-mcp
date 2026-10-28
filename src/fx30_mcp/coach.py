@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from . import config, meter
 from .balance import MIN_BRIGHTNESS, STOP_TOLERANCE, balance
-from .camera import WEDGED_HINT, CameraBase, CameraError
+from .camera import CameraBase, CameraError
 from .config import Settings
 from .plan import (
     MIN_KEY_FT,
@@ -217,8 +217,9 @@ class Coach:
             self._show("stopped", "Coach stopped", None)
         except _Recording:
             self._show("stopped", *RECORDING)
-        except CameraError:
-            self._show("stopped", "Camera stopped answering", WEDGED_HINT)
+        except CameraError as err:
+            # The camera layer already says what to do: a timeout carries the power-cycle hint, others their own.
+            self._show("stopped", "Camera stopped answering", str(err))
         except LightError as err:
             self._show("stopped", "A light stopped answering", str(err))
         except Exception as err:

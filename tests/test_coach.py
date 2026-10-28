@@ -245,14 +245,18 @@ def test_camera_error_stops_cleanly():
 
     async def frame():
         if coach.state.get("step") == "balance":
-            raise CameraError("timeout")
+            raise CameraError("live view sent no picture (0 bytes); is the camera showing live view?")
         return await real()
 
     camera.frame = frame
     walk(coach, when(coach, at("place_key"), coach.light_in_place))
     last = states[-1]
     assert last["step"] == "stopped"
-    assert (last["instruction"], last["detail"]) == ("Camera stopped answering", WEDGED_HINT)
+    assert (last["instruction"], last["detail"]) == (
+        "Camera stopped answering",
+        "live view sent no picture (0 bytes); is the camera showing live view?",
+    )
+    assert WEDGED_HINT not in last["detail"]
     assert coach.running is False
 
 
