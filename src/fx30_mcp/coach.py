@@ -1,0 +1,349 @@
+"""Coach a talking-head shot, one instruction at a time.
+
+start() looks at the room with the lights off and plans the shot. run() then
+walks the steps: the camera settings on the card (ISO, shutter and aperture are
+the owner's to set, so the coach asks and checks the readback), where the key
+goes and which side it lights, the fill when there is one, then the existing
+balance loop. It ends at Ready. Every change of instruction or light goes out
+through publish as one state dict, for the page.
+
+The coach never closes the camera: the server holds it, and a process that
+drops the FX30 uncleanly leaves it needing a power cycle.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import inspect
+import math
+from typing import Any, Awaitable, Callable
+
+from . import config, meter
+from .balance import STOP_TOLERANCE, balance
+from .camera import WEDGED_HINT, CameraBase, CameraError
+from .config import Settings
+from .plan import (
+    MIN_KEY_FT,
+    UNEVEN_STOPS,
+    Plan,
+    closer,
+    exposure_change,
+    exposure_of,
+    face_light,
+    fmt_ft,
+    make_plan,
+    ratio_light,
+    window_light,
+)
+from .survey import Survey, key_check, survey
+
+CARD_TOLERANCE = 1 / 3  # stops the window may sit off its range before the card is redone
+MAX_RECOMPUTES = 4
+LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO"}  # asked in this order
+CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
+
+
+class LightError(Exception):
+    """A light stopped answering: amaran Desktop closed, Bluetooth dropped, a bad reply."""
+
+
+class _Light:
+    """A light whose failures come out as LightError, so they are told apart from the coach's own."""
+
+    def __init__(self, light: Any) -> None:
+        self._light = light
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._light, name)
+        if not inspect.iscoroutinefunction(value):
+            return value
+
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await value(*args, **kwargs)
+            except CameraError:
+                raise
+            except Exception as err:
+                raise LightError(str(err)) from err
+
+        return call
+
+
+class _Stopped(Exception):
+    pass
+
+
+def _number(setting: str, text: Any) -> float | None:
+    """A camera value as a number, whatever form it is written in: "f/2.8" or "2.8", "1/60" or '1/60"'."""
+
+    text = str(text).strip().strip('"')
+    try:
+        if setting == "aperture":
+            return float(text.lstrip("fF/"))
+        if setting == "shutter":
+            if "/" in text:
+                top, bottom = text.split("/")
+                return float(top) / float(bottom)
+            return float(text)
+        return float(text.split()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _matches(setting: str, current: Any, wanted: str) -> bool:
+    if current is None:
+        return True  # the camera does not report it, so there is nothing to wait for
+    have, want = _number(setting, current), _number(setting, wanted)
+    if have is None or want is None:
+        return str(current) == wanted
+    return math.isclose(have, want, rel_tol=0.02)
+
+
+class Coach:
+    def __init__(
+        self,
+        camera: CameraBase,
+        key: Any,
+        fill: Any | None,
+        settings: Settings,
+        publish: Callable[[dict], None],
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        settle: float = 0.7,
+        override: str | None = None,
+    ) -> None:
+        self.camera = camera
+        self.key = _Light(key)
+        self.fill = None if fill is None else _Light(fill)
+        self.settings = settings
+        self.publish = publish
+        self.sleep = sleep
+        self.settle = settle
+        self.override = override
+        self.state: dict = {}
+        self.plan: Plan | None = None
+        self.latest_frame: bytes | None = None
+        self.running = False
+        self._survey: Survey | None = None
+        self._truthful = False
+        self._box: meter.Box | None = None
+        self._window: meter.Window | None = None
+        self._lights: dict[str, str | None] = {"face": "red", "window": None, "ratio": None}
+        self._begun = asyncio.Event()
+        self._in_place = asyncio.Event()
+        self._stopping = False
+
+    @property
+    def curve(self) -> str:
+        """How live view encodes brightness."""
+
+        return "slog3" if self.settings.profile == "slog3" else "rec709"
+
+    def begin(self) -> None:
+        self._begun.set()
+
+    def light_in_place(self) -> None:
+        self._in_place.set()
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._begun.set()
+        self._in_place.set()
+
+    async def start(self) -> Plan | None:
+        """Survey with the lights off and plan; None, asking them to sit in the shot, without a face."""
+
+        found = await survey(self.camera, self.key, self.fill, self.curve, self.settle, self.sleep)
+        self._survey = found
+        self.latest_frame = found.frame
+        self._truthful = self.curve == "slog3" or (found.info.get("gamma") == "Rec709" and self.curve == "rec709")
+        self._judge(found.reading, found.window)
+        if not found.reading.face:
+            self.plan = None
+            self._show("camera", "Sit in the shot", "The coach needs your face in the frame to plan.", screen="plan")
+            return None
+        self._box = found.reading.box
+        self.plan = make_plan(found, self.settings, self.override)
+        self._show("camera", "Tap Start when you're in place", None, screen="plan")
+        return self.plan
+
+    async def run(self) -> None:
+        """Wait for begin(), then camera, key, fill, balance, Ready. Stops on stop() or a camera or light error."""
+
+        if self.plan is None:
+            return
+        self.running = True
+        try:
+            await self._begun.wait()
+            self._check()
+            await self._camera_step()
+            await self._place_key()
+            if self.fill is not None:
+                await self._wait("place_key", f"Fill on camera-{self.plan.fill_side}", "Next to the lens. Tap when it's there.")
+            await self._balance_step()
+            await self._look()
+            self._show("ready", "Ready to record", None)
+        except _Stopped:
+            self._show("stopped", "Coach stopped", None)
+        except CameraError:
+            self._show("stopped", "Camera stopped answering", WEDGED_HINT)
+        except LightError as err:
+            self._show("stopped", "A light stopped answering", str(err))
+        finally:
+            self.running = False
+
+    def _check(self) -> None:
+        if self._stopping:
+            raise _Stopped
+
+    def _show(self, step: str, instruction: str, detail: str | None, screen: str = "coach") -> None:
+        state = {
+            "screen": screen,
+            "step": step,
+            "instruction": instruction,
+            "detail": detail,
+            "lights": dict(self._lights),
+            "plan": self.plan.to_json() if self.plan else None,
+        }
+        if state != self.state:
+            self.state = state
+            self.publish(state)
+
+    def _judge(self, reading: meter.Reading, window: meter.Window | None) -> None:
+        self._window = window
+        stops = meter.stops_off(reading.lit, self.settings.target, self.curve)
+        contrast = reading.contrast(self.curve) if self.fill is not None and reading.face else None
+        self._lights = {
+            "face": face_light(stops),
+            "window": window_light(window, reading.lit, self.curve, self._truthful),
+            "ratio": ratio_light(contrast, self.settings.fill_ratio),
+        }
+
+    async def _look(self) -> meter.Reading:
+        """Read a frame and update the lights from it."""
+
+        frame = await self.camera.frame()
+        self.latest_frame = frame
+        reading = await asyncio.to_thread(meter.read, frame)
+        if reading.face:
+            self._box = reading.box
+        window = await asyncio.to_thread(meter.find_window, frame, reading.box, self.curve)
+        self._judge(reading, window)
+        return reading
+
+    def _under(self, reading: meter.Reading) -> float:
+        return meter.stops_off(reading.lit, self.settings.target, self.curve)
+
+    async def _wait(
+        self,
+        step: str,
+        instruction: str,
+        detail: str | None,
+        done: Callable[[meter.Reading], bool] | None = None,
+    ) -> meter.Reading | None:
+        """Show an instruction and keep the lights live until they tap, or done() says the frame is there."""
+
+        self._in_place.clear()
+        self._show(step, instruction, detail)
+        reading = None
+        while not self._in_place.is_set():
+            self._check()
+            reading = await self._look()
+            self._show(step, instruction, detail)
+            if done is not None and done(reading):
+                break
+            await self.sleep(self.settle)
+        self._check()
+        return reading
+
+    async def _camera_step(self) -> None:
+        """Ask for each card setting until the readback matches; redo the card while the window is off."""
+
+        recomputes = 0
+        while True:
+            self._check()
+            current = await self.camera.settings()
+            await self._look()
+            card = self.plan.camera
+            wrong = next((s for s in LABELS if not _matches(s, current.get(s), getattr(card, s))), None)
+            if wrong is not None:
+                detail = LABELS[wrong] if card.note is None else f"{LABELS[wrong]}. {card.note}"
+                self._show("camera", f"Set {getattr(card, wrong)} on the camera", detail)
+                await self.sleep(self.settle)
+                continue
+            change = exposure_change(self._window, self.settings.target, self.curve, self.settings.window_range)
+            if abs(change) <= CARD_TOLERANCE or recomputes >= MAX_RECOMPUTES:
+                return
+            recomputes += 1
+            seen = dataclasses.replace(self._survey, camera=current, window=self._window)
+            self.plan = make_plan(seen, self.settings, self.override)
+
+    async def _place_key(self) -> None:
+        geometry = self.plan.geometry
+        side = geometry.side
+        instruction = f"Key on camera-{side}"
+        detail = (
+            f"{fmt_ft(geometry.distance_ft)} from your face, {fmt_ft(geometry.height_ft)} above your eyes, "
+            "aimed down. Tap when it's there."
+        )
+        while True:
+            await self._wait("place_key", instruction, detail)
+            check = await key_check(self.camera, self.key, self._box, self.curve, self.settle, self.sleep)
+            near, far = check.sides if side == "left" else reversed(check.sides)
+            if check.lit is None:
+                instruction, detail = "Turn the key on", "The key isn't reaching your face."
+            elif far > near * 2**UNEVEN_STOPS:
+                instruction, detail = "Key is on the wrong side", f"Move it to camera-{side}."
+            else:
+                return  # a soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong
+
+    async def _balance_step(self) -> None:
+        """Balance; with the key at full and the face still under, ask for it closer and balance again."""
+
+        while True:
+            self._show("balance", "Hold still", "Setting the light on your face.")
+            result = await balance(
+                self.camera,
+                self.key,
+                self.settings,
+                kelvin=self.plan.kelvin,
+                settle=self.settle,
+                sleep=self.sleep,
+                fill=self.fill,
+                target=self.settings.target,
+            )
+            await self._save_key_output(result)
+            self._check()
+            last = result["steps"][-1]
+            under = last["stops"]
+            if result["light"]["brightness"] < 100 or under <= STOP_TOLERANCE or not last["face"]:
+                return
+            # Moving the key or opening up shows as a brighter face; then balance again.
+            def enough(reading: meter.Reading) -> bool:
+                return self._under(reading) <= STOP_TOLERANCE
+
+            d0 = self.plan.geometry.distance_ft
+            d1 = closer(d0, under)
+            if d1 < MIN_KEY_FT:
+                await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, enough)
+                continue
+            reading = await self._wait("balance", "Key closer", f"{fmt_ft(d0)} to {fmt_ft(d1)}", enough)
+            if reading is not None:
+                # Half the distance is two stops: read how far it moved from how much brighter the face is.
+                self.plan.geometry.distance_ft = closer(d0, under - self._under(reading))
+
+    async def _save_key_output(self, result: dict[str, Any]) -> None:
+        """Remember what the key does at full from where it is, for the next plan's key percent."""
+
+        last = result["steps"][-1]
+        if not last["face"]:
+            return
+        current = await self.camera.settings()
+        brightness = result["light"]["brightness"]
+        self.settings.key_output = {
+            "modifier": self.settings.key_modifier,
+            "distance_ft": self.plan.geometry.distance_ft,
+            "stops_at_full": round(-last["stops"] + math.log2(100 / brightness), 3),
+            "exposure": round(exposure_of(current["iso"], current["shutter"], current["aperture"]), 3),
+        }
+        config.save(self.settings)

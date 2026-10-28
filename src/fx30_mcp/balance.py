@@ -83,10 +83,14 @@ async def balance(
     settle: float = 0.7,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     fill: Any = None,
+    target: float | None = None,
 ) -> dict[str, Any]:
-    """Bring the face to settings.target with the key light and, given a fill light,
-    the shadow side to settings.fill_ratio stops below the lit side. Returns what it
-    did and where it ended."""
+    """Bring the face to target (settings.target unless given) with the key light and,
+    given a fill light, the shadow side to settings.fill_ratio stops below the lit side.
+    Returns what it did and where it ended."""
+
+    if target is None:
+        target = settings.target
 
     if light.state.brightness is None or light.state.kelvin is None:
         try:
@@ -122,7 +126,7 @@ async def balance(
     tint_flipped = False
     for _ in range(max_steps):
         reading = await asyncio.to_thread(meter.read, await camera.frame())
-        stops = meter.stops_off(reading.lit, settings.target, settings.profile)
+        stops = meter.stops_off(reading.lit, target, settings.profile)
         if reading.clipped > CLIP_LIMIT:
             stops = min(stops, -1 / 3)
         # Skin colour means something only on skin.
@@ -193,7 +197,7 @@ async def balance(
         "done": done,
         "kelvin": kelvin,
         "light": {"brightness": brightness, "tint": tint},
-        "target": settings.target,
+        "target": target,
         "profile": settings.profile,
         "steps": [_round(s) for s in steps],
         "advice": result_advice,
