@@ -85,6 +85,11 @@ function fmtFt(feet) {
   return halves < 2 ? Math.round(halves * 12) + " in" : halves + " ft";
 }
 
+// fill_ratio is in stops; the lighting ratio is 2 to that power: 1 stop is "2:1", 0.5 is "1.4:1".
+function fmtRatio(stops) {
+  return Math.round(2 ** stops * 10) / 10 + ":1";
+}
+
 function svg(parent, tag, attrs, text) {
   const el = document.createElementNS(NS, tag);
   for (const k in attrs) el.setAttribute(k, attrs[k]);
@@ -155,7 +160,8 @@ function showPlan(s) {
   $("camera-card").textContent = `ISO ${c.iso} · ${c.shutter} · ${c.aperture} · ${plan.kelvin}K`;
   $("camera-note").textContent = c.note || "";
   const key = plan.key_percent == null ? "Key at the level the coach finds" : `Key about ${plan.key_percent}% at ${plan.kelvin}K`;
-  $("lights-card").textContent = `${key} · Fill ratio ${plan.fill_ratio}:1 on camera-${plan.fill_side}`;
+  const fill = plan.has_fill ? `Fill ${fmtRatio(plan.fill_ratio)} on camera-${plan.fill_side}` : "No fill light";
+  $("lights-card").textContent = `${key} \u00b7 ${fill}`;
   $("why").textContent = plan.why;
   $("plan-note").textContent = plan.note || "";
 }

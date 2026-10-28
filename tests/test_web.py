@@ -1,10 +1,12 @@
 import asyncio
 import json
 
+import pytest
 from starlette.testclient import TestClient
 
-from fx30_mcp.config import Settings
+from fx30_mcp import meter
 from fx30_mcp.coach import Coach
+from fx30_mcp.config import Settings
 from fx30_mcp.sim import SimCamera, SimLight
 from fx30_mcp.web import Broadcaster, make_app, start_web
 
@@ -106,24 +108,27 @@ def test_every_response_sends_no_referrer():
     assert client.get("/?key=k").headers["referrer-policy"] == "no-referrer"
 
 
-def test_published_plan_says_whether_there_is_a_fill():
-    import asyncio as aio
-    from fx30_mcp import config, meter
+def test_page_shows_the_lighting_ratio_and_the_no_fill_case():
+    coach, broadcaster = build()
+    html = TestClient(make_app(coach, "k", broadcaster)).get("/?key=k").text
+    assert "No fill light" in html
+    assert "fmtRatio(plan.fill_ratio)" in html
+    assert "${plan.fill_ratio}:1" not in html
 
-    async def go(fill):
+
+def test_published_plan_says_whether_there_is_a_fill(monkeypatch):
+    monkeypatch.setattr(meter, "find_face", lambda _j: (100 / 320, 40 / 180, 120 / 320, 100 / 180))
+    monkeypatch.setattr(meter, "face_yaw", lambda _j: None)
+
+    async def no_wait(_seconds):
+        pass
+
+    async def has_fill(fill):
         key = SimLight()
         states = []
-        coach = Coach(SimCamera(key, window=4.0), key, fill, Settings(), states.append, sleep=lambda _s: aio.sleep(0))
+        coach = Coach(SimCamera(key, window=4.0), key, fill, Settings(), states.append, sleep=no_wait)
         await coach.start()
         return states[-1]["plan"]["has_fill"]
 
-    import pytest
-
-    mp = pytest.MonkeyPatch()
-    mp.setattr(meter, "find_face", lambda _j: (100 / 320, 40 / 180, 120 / 320, 100 / 180))
-    mp.setattr(meter, "face_yaw", lambda _j: None)
-    try:
-        assert asyncio.run(go(None)) is False
-        assert asyncio.run(go(SimLight())) is True
-    finally:
-        mp.undo()
+    assert asyncio.run(has_fill(None)) is False
+    assert asyncio.run(has_fill(SimLight())) is True
