@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 import functools
 import json
+import logging
 import os
 from typing import Annotated, Any
 
@@ -22,6 +23,8 @@ from .camera import CameraBase, CameraError, GPhotoCamera
 from .coach import Coach, LightError
 from .web import Broadcaster, WebHandle, start_web
 
+log = logging.getLogger(__name__)
+
 BACKEND = os.environ.get("FX30_BACKEND", "gphoto2").lower()
 
 _camera: CameraBase | None = None
@@ -30,8 +33,10 @@ _named_lights: dict[tuple[str, str], Any] = {}  # (name, backend) -> light
 _busy = asyncio.Lock()
 _coach: Coach | None = None  # the shot coach, while one runs; it holds _busy
 _web: WebHandle | None = None
-_coach_task: asyncio.Task | None = None
-_closing: set[asyncio.Task] = set()
+_coach_task: asyncio.Task | None = None  # the survey while starting, then Coach.run()
+_holds_busy = False  # True while the coach (not a balance) holds _busy
+MODIFIERS = ("bare", "reflector", "softbox", "lantern", "umbrella")
+SIZED = ("softbox", "lantern", "umbrella")
 
 
 def camera() -> CameraBase:
@@ -116,15 +121,17 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        await _end_coach()
-        if _camera is not None:
-            await _camera.close()
-        if BACKEND != "sim":
-            from amaran_mcp.backends import close_all
+        try:
+            await _end_coach()
+        finally:
+            if _camera is not None:
+                await _camera.close()
+            if BACKEND != "sim":
+                from amaran_mcp.backends import close_all
 
-            for lamp in _named_lights.values():
-                await lamp.close()
-            await close_all()
+                for lamp in _named_lights.values():
+                    await lamp.close()
+                await close_all()
 
 
 mcp = MCPServer(
@@ -246,7 +253,7 @@ async def balance_shot(
     Leaves the camera's exposure settings alone and says what to change if a light runs out
     of range."""
 
-    if _coach is not None:
+    if _coach_task is not None and not _coach_task.done():
         raise ToolError("the shot coach is running; stop_coach first")
     if _busy.locked():
         raise ToolError("a balance is already running")
@@ -269,6 +276,7 @@ async def set_face_target(
     takes them from the current frame: light it how you like, then call this."""
 
     settings = config.load()
+    skipped = None
     if profile is not None:
         if profile not in meter.PROFILES:
             raise ToolError(f"profile must be one of {', '.join(meter.PROFILES)}")
@@ -281,14 +289,17 @@ async def set_face_target(
         window = await asyncio.to_thread(meter.find_window, jpeg, reading.box, settings.profile)
         if window is not None:
             over = meter.stops_off(reading.lit, window.level, settings.profile)
-            settings.window_range = [round(over - 1, 2), round(over + 1, 2)]
+            if window.clipped > 0.02:
+                skipped = "window_range not saved: the window clips in this frame"
+            else:
+                settings.window_range = [round(over - 1, 2), round(over + 1, 2)]
         settings.face_level = round(reading.lit, 3)
         if reading.hue is not None:
             settings.skin_hue = round(reading.hue, 1)
     else:
         settings.face_level = level
     config.save(settings)
-    return settings.__dict__
+    return settings.__dict__ if skipped is None else {**settings.__dict__, "note": skipped}
 
 
 @tool(annotations=CHANGES)
@@ -345,6 +356,13 @@ async def stop_recording() -> str:
     return "stopped"
 
 
+def _release_busy() -> None:
+    global _holds_busy
+    if _holds_busy:
+        _holds_busy = False
+        _busy.release()
+
+
 async def _end_coach() -> bool:
     """Stop the coach and its page and release _busy; False when no coach was running.
     Camera and lights are left as they are."""
@@ -354,26 +372,31 @@ async def _end_coach() -> bool:
     if coach is None:
         return False
     _coach = _web = _coach_task = None
-    coach.stop()
-    if task is not None and not task.done():
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
     try:
+        coach.stop()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("the shot coach failed while stopping")
         if web is not None:
             await web.close()
     finally:
-        if _busy.locked():
-            _busy.release()
+        _release_busy()
     return True
 
 
-def _coach_finished(_task: asyncio.Task) -> None:
-    """The coach's run ended on its own (Ready, or a camera or light error): tidy up."""
+def _coach_finished(task: asyncio.Task) -> None:
+    """The coach's run ended on its own (Ready, or stopped after an error): free _busy and
+    keep the page up showing the final state, until stop_coach, start_recording or a new coach_shot."""
 
-    closing = asyncio.get_running_loop().create_task(_end_coach())
-    _closing.add(closing)
-    closing.add_done_callback(_closing.discard)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("the shot coach failed", exc_info=task.exception())
+    if task is _coach_task:
+        _release_busy()
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -386,37 +409,54 @@ async def coach_shot(
     where the key and fill go, then the balance. Returns a QR code and the link; the plan is in
     the JSON. stop_coach ends it."""
 
-    global _coach, _web, _coach_task
+    global _coach, _web, _coach_task, _holds_busy
     if key_side not in (None, "left", "right"):
         raise ToolError("key_side must be left or right")
+    if modifier is not None and modifier not in MODIFIERS:
+        raise ToolError(f"modifier must be one of {', '.join(MODIFIERS)}")
+    if _coach_task is not None and not _coach_task.done():
+        raise ToolError("a balance or the shot coach is already running")
+    await _end_coach()  # a coach that finished still has its page up
     if _busy.locked():
         raise ToolError("a balance or the shot coach is already running")
     settings = config.load()
-    if modifier is not None or size_in is not None:
-        if modifier is not None:
-            settings.key_modifier = modifier
-        if size_in is not None:
-            settings.key_size_in = size_in
-        config.save(settings)
-    if settings.key_modifier is None:
+    new_modifier = modifier or settings.key_modifier
+    new_size = size_in if size_in is not None else settings.key_size_in
+    if new_modifier is None:
         raise ToolError("What is on the 100x S: bare, reflector, softbox, lantern or umbrella? "
                         "Give its size in inches for a softbox, lantern or umbrella.")
+    if new_modifier in SIZED and not new_size:
+        raise ToolError(f"How wide is the {new_modifier} in inches? Call coach_shot again with size_in.")
+    if (new_modifier, new_size) != (settings.key_modifier, settings.key_size_in):
+        settings.key_modifier, settings.key_size_in = new_modifier, new_size
+        config.save(settings)
+    broadcaster = Broadcaster()
+    coach = Coach(camera(), light(), fill_light(), settings, broadcaster.publish, override=key_side)
     await _busy.acquire()
+    _holds_busy = True
+    _coach = coach  # from here, stop_coach and start_recording can end it
     try:
         await take_over_light()
-        broadcaster = Broadcaster()
-        coach = Coach(camera(), light(), fill_light(), settings, broadcaster.publish, override=key_side)
+        start = _coach_task = asyncio.create_task(coach.start())
         try:
-            plan = await coach.start()
+            plan = await start
         except LightError as err:
             raise ToolError(str(err)) from err
+        except asyncio.CancelledError:
+            if start.cancelled():
+                raise ToolError("the shot coach was stopped before it began") from None
+            raise
         if plan is None:
             raise ToolError("No face in the frame. Sit in the shot, then call coach_shot again.")
         web = await start_web(coach, broadcaster)
+        if _coach is not coach:
+            await web.close()
+            raise ToolError("the shot coach was stopped before it began")
     except BaseException:
-        _busy.release()
+        if _coach is coach:
+            await _end_coach()
         raise
-    _coach, _web = coach, web
+    _web = web
     _coach_task = asyncio.create_task(coach.run())
     _coach_task.add_done_callback(_coach_finished)
     return [Image(data=web.qr_png, format="png"),

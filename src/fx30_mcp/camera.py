@@ -103,6 +103,19 @@ class GPhotoCamera(CameraBase):
         self.name = "camera"
         self.recording = False
 
+    async def _thread(self, fn, *args):
+        """Run fn in a thread. If the caller is cancelled, wait for the thread to finish
+        first, so nothing else touches the camera handle while a call is still in flight."""
+
+        future = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await asyncio.wait([future])
+            if not future.cancelled():
+                future.exception()  # mark it retrieved; its result no longer matters
+            raise
+
     async def _run(self, fn, *args):
         import gphoto2 as gp
 
@@ -111,8 +124,8 @@ class GPhotoCamera(CameraBase):
         async with self._lock:
             try:
                 if self._camera is None:
-                    self._camera = await asyncio.to_thread(self._open)
-                return await asyncio.to_thread(fn, *args)
+                    self._camera = await self._thread(self._open)
+                return await self._thread(fn, *args)
             except gp.GPhoto2Error as err:
                 if err.code in (gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO,
                                 gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY, gp.GP_ERROR_TIMEOUT):

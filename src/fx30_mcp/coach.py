@@ -428,4 +428,6 @@ class Coach:
             "stops_at_full": round(-last["stops"] + math.log2(100 / brightness), 3),
             "exposure": round(exposure_of(current["iso"], current["shutter"], current["aperture"]), 3),
         }
-        config.save(self.settings)
+        saved = config.load()  # only this field, so settings changed during the session survive
+        saved.key_output = self.settings.key_output
+        config.save(saved)

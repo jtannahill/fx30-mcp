@@ -284,6 +284,21 @@ def test_saves_key_output_after_balance():
     assert config.load().key_output == output
 
 
+def test_key_output_save_keeps_settings_changed_during_the_session():
+    camera, key = sim(curve=1.0)
+    coach, _states = coach_for(camera, key, Settings(key_modifier="softbox", key_size_in=24))
+
+    def owner_saves_a_target_then_places_the_light():
+        saved = config.load()
+        saved.face_level = 0.42
+        config.save(saved)
+        coach.light_in_place()
+
+    walk(coach, when(coach, at("place_key"), owner_saves_a_target_then_places_the_light))
+    saved = config.load()
+    assert saved.key_output is not None and saved.face_level == 0.42
+
+
 def test_moving_the_key_closer_balances_again():
     camera, key = sim(stops_at_full=-1.0)
     settings = Settings(key_modifier="softbox", key_size_in=24)
