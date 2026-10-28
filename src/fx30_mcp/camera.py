@@ -92,6 +92,13 @@ class CameraBase:
     async def close(self) -> None: ...
 
 
+def _wedged_codes(gp) -> tuple[int, ...]:
+    """The gphoto2 errors after which the session is no good and is let go."""
+
+    return (gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO,
+            gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY, gp.GP_ERROR_TIMEOUT)
+
+
 class GPhotoCamera(CameraBase):
     backend = "gphoto2"
 
@@ -103,18 +110,32 @@ class GPhotoCamera(CameraBase):
         self.name = "camera"
         self.recording = False
 
-    async def _thread(self, fn, *args):
-        """Run fn in a thread. If the caller is cancelled, wait for the thread to finish
-        first, so nothing else touches the camera handle while a call is still in flight."""
+    async def _thread(self, fn, *args, keep: bool = False):
+        """Run fn in a thread and always wait for it to finish, however often the caller is
+        cancelled, so nothing else touches the camera handle while a call is in flight.
+        A cancelled call still ends the way an uncancelled one would: a handle that was
+        opened is kept (keep=True) for idle close to exit, and a wedged session is dropped.
+        Then the cancellation goes on."""
+
+        import gphoto2 as gp
 
         future = asyncio.ensure_future(asyncio.to_thread(fn, *args))
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await asyncio.wait([future])
-            if not future.cancelled():
-                future.exception()  # mark it retrieved; its result no longer matters
-            raise
+        cancelled = False
+        while not future.done():
+            try:
+                await asyncio.wait([future])
+            except asyncio.CancelledError:
+                cancelled = True
+        if future.cancelled():
+            raise asyncio.CancelledError
+        error = future.exception()
+        if keep and error is None:
+            self._camera = future.result()
+        if not cancelled:
+            return future.result()
+        if isinstance(error, gp.GPhoto2Error) and error.code in _wedged_codes(gp):
+            await self._drop()
+        raise asyncio.CancelledError
 
     async def _run(self, fn, *args):
         import gphoto2 as gp
@@ -124,11 +145,10 @@ class GPhotoCamera(CameraBase):
         async with self._lock:
             try:
                 if self._camera is None:
-                    self._camera = await self._thread(self._open)
+                    self._camera = await self._thread(self._open, keep=True)
                 return await self._thread(fn, *args)
             except gp.GPhoto2Error as err:
-                if err.code in (gp.GP_ERROR_MODEL_NOT_FOUND, gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_IO,
-                                gp.GP_ERROR_IO_USB_FIND, gp.GP_ERROR_CAMERA_BUSY, gp.GP_ERROR_TIMEOUT):
+                if err.code in _wedged_codes(gp):
                     await self._drop()
                     raise CameraError(f"{err}. {WEDGED_HINT if err.code == gp.GP_ERROR_TIMEOUT else PC_REMOTE_HINT}") from err
                 raise CameraError(str(err)) from err
@@ -187,7 +207,7 @@ class GPhotoCamera(CameraBase):
         if self._camera is not None:
             camera, self._camera = self._camera, None
             try:
-                await asyncio.to_thread(camera.exit)
+                await self._thread(camera.exit)
             except Exception:
                 pass
 

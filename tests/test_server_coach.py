@@ -246,3 +246,34 @@ def test_start_recording_ends_a_coach_that_is_still_starting(server):
         await server.stop_coach()
 
     asyncio.run(go())
+
+
+def test_changing_the_modifier_does_not_reuse_the_old_size(server):
+    async def go():
+        try:
+            await server.coach_shot(modifier="softbox", size_in=24)
+            await server.stop_coach()
+            with pytest.raises(ToolError, match="inches"):
+                await server.coach_shot(modifier="lantern")
+            await server.coach_shot(modifier="bare")
+            assert config.load().key_size_in is None
+        finally:
+            await server.stop_coach()
+
+    asyncio.run(go())
+
+
+def test_a_stop_during_take_over_does_not_start_a_survey(server, monkeypatch):
+    async def go():
+        async def slow_take_over():
+            await asyncio.sleep(0.1)
+
+        monkeypatch.setattr(server, "take_over_light", slow_take_over)
+        starting = asyncio.create_task(server.coach_shot(modifier="bare"))
+        await asyncio.sleep(0.02)
+        await server.stop_coach()
+        with pytest.raises(ToolError, match="stopped"):
+            await starting
+        assert server._coach is None and not server._busy.locked()
+
+    asyncio.run(go())

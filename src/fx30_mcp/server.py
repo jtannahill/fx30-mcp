@@ -421,7 +421,9 @@ async def coach_shot(
         raise ToolError("a balance or the shot coach is already running")
     settings = config.load()
     new_modifier = modifier or settings.key_modifier
-    new_size = size_in if size_in is not None else settings.key_size_in
+    new_size = size_in if size_in is not None else (settings.key_size_in if new_modifier == settings.key_modifier else None)
+    if new_modifier not in SIZED:
+        new_size = None
     if new_modifier is None:
         raise ToolError("What is on the 100x S: bare, reflector, softbox, lantern or umbrella? "
                         "Give its size in inches for a softbox, lantern or umbrella.")
@@ -437,6 +439,8 @@ async def coach_shot(
     _coach = coach  # from here, stop_coach and start_recording can end it
     try:
         await take_over_light()
+        if _coach is not coach:
+            raise ToolError("the shot coach was stopped before it began")
         start = _coach_task = asyncio.create_task(coach.start())
         try:
             plan = await start
