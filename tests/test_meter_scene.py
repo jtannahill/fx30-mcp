@@ -51,3 +51,10 @@ def test_face_yaw_none_without_a_face():
     out = io.BytesIO()
     Image.new("RGB", (320, 180), (128, 128, 128)).save(out, "JPEG")
     assert meter.face_yaw(out.getvalue()) is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Apple Vision runs on macOS only")
+def test_catchlight_skips_small_or_missing_eyes():
+    out = io.BytesIO()
+    Image.new("RGB", (320, 180), (128, 128, 128)).save(out, "JPEG")
+    assert meter.catchlight(out.getvalue(), out.getvalue()) is None

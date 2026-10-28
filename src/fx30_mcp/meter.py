@@ -274,3 +274,77 @@ def key_only(on: bytes, off: bytes, box: Box, profile: str) -> tuple[float, floa
 
     added = [np.median(np.maximum(a - b, 0)) for a, b in zip(halves(on), halves(off))]
     return float(added[0]), float(added[1])
+
+
+MIN_EYE_PX = 12
+CATCHLIGHT_CONTRAST = 4.0  # the key's spot must be this many times the eye box's median to count
+
+
+def _pupils(jpeg: bytes) -> tuple[Box, list[tuple[float, float]]] | None:
+    """The largest face and its pupils as fractions of the frame, top left origin; None without both."""
+
+    import Vision
+    from Foundation import NSData, NSDictionary
+
+    data = NSData.dataWithBytes_length_(jpeg, len(jpeg))
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, NSDictionary.dictionary())
+    request = Vision.VNDetectFaceLandmarksRequest.alloc().init()
+    ok, error = handler.performRequests_error_([request], None)
+    if not ok:
+        raise ValueError(f"live view frame is not a readable image: {error}")
+    faces = list(request.results() or [])
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height)
+    landmarks = face.landmarks()
+    if landmarks is None:
+        return None
+    box = face.boundingBox()
+    x, y, w, h = box.origin.x, box.origin.y, box.size.width, box.size.height
+    pupils = []
+    for region in (landmarks.leftPupil(), landmarks.rightPupil()):
+        if region is None or region.pointCount() < 1:
+            continue
+        px, py = region.normalizedPoints()[0]
+        # Pupil points are within the face box, from its bottom left.
+        pupils.append((x + float(px) * w, 1 - (y + float(py) * h)))
+    if not pupils:
+        return None
+    return (x, 1 - y - h, w, h), pupils
+
+
+def catchlight(on: bytes, off: bytes, profile: str = "rec709") -> str | None:
+    """Is the key's reflection in the eyes where it belongs: "ok", "raise" (it sits
+    below the pupil), "lower" (none found), or None when the eyes cannot be read.
+
+    Best effort. The spot is the brightest point the key adds inside a small box
+    around each pupil, and it must stand well clear of the rest of the box."""
+
+    found = _pupils(on)
+    if found is None:
+        return None
+    face, pupils = found
+    lit, dark = _decode(on), _decode(off)
+    height, width, _ = lit.shape
+    half = max(face[2] * width / 6, 0) / 2
+    if half * 2 < MIN_EYE_PX or dark.shape != lit.shape:
+        return None
+    added = np.maximum(
+        np.asarray(PROFILES[profile][0](_luma(lit.reshape(-1, 3))), dtype=float)
+        - np.asarray(PROFILES[profile][0](_luma(dark.reshape(-1, 3))), dtype=float),
+        0,
+    ).reshape(height, width)
+    spots = []
+    for fx, fy in pupils:
+        cx, cy = fx * width, fy * height
+        left, right = max(0, int(cx - half)), min(width, int(cx + half) + 1)
+        top, bottom = max(0, int(cy - half)), min(height, int(cy + half) + 1)
+        box = added[top:bottom, left:right]
+        if box.size == 0:
+            continue
+        row, _col = np.unravel_index(int(np.argmax(box)), box.shape)
+        if box.max() >= CATCHLIGHT_CONTRAST * max(float(np.median(box)), 0.005):
+            spots.append(top + row >= cy)  # image rows grow downward: True when below the pupil centre
+    if not spots:
+        return "lower"
+    return "raise" if all(spots) else "ok"

@@ -543,3 +543,40 @@ def test_window_clipping_with_the_card_at_its_darkest_says_so(monkeypatch):
     )
     assert any(hopeless(s) for s in states)
     assert not any(s["step"] == "ready" for s in states)
+
+
+def _catchlight_run(monkeypatch, verdict):
+    camera, key = sim()
+    calls: list[int] = []
+
+    def fake(*_args):
+        calls.append(1)
+        return verdict if len(calls) == 1 else None
+
+    monkeypatch.setattr(meter, "catchlight", fake)
+    coach, states = coach_for(camera, key)
+    asked = lambda state: state.get("instruction") in ("Raise the key", "Lower the key a little")  # noqa: E731
+    walk(coach, when(coach, at("place_key"), coach.light_in_place), when(coach, asked, coach.light_in_place))
+    return states, calls
+
+
+def test_low_catchlight_says_raise_then_reaches_ready(monkeypatch):
+    states, calls = _catchlight_run(monkeypatch, "raise")
+    shown = next(s for s in states if s["instruction"] == "Raise the key")
+    assert shown["detail"] == "The catchlight is low in your eyes."
+    assert states[-1]["step"] == "ready"
+    assert len(calls) <= 3
+
+
+def test_missing_catchlight_says_lower(monkeypatch):
+    states, _ = _catchlight_run(monkeypatch, "lower")
+    shown = next(s for s in states if s["instruction"] == "Lower the key a little")
+    assert shown["detail"] == "There's no catchlight in your eyes."
+    assert states[-1]["step"] == "ready"
+
+
+def test_unreadable_eyes_add_no_step(monkeypatch):
+    states, calls = _catchlight_run(monkeypatch, None)
+    assert not any(s["instruction"] in ("Raise the key", "Lower the key a little") for s in states)
+    assert states[-1]["step"] == "ready"
+    assert len(calls) == 1

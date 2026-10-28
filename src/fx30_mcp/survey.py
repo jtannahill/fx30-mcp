@@ -33,6 +33,8 @@ class Survey:
 class KeyCheck:
     sides: tuple[float, float]
     lit: str | None  # "left" or "right" of the frame, None when the key adds next to nothing
+    on: bytes = b""  # the frames the check compared, kept for the catchlight check
+    off: bytes = b""
 
 
 async def _was_on(light: Any) -> bool:
@@ -91,5 +93,5 @@ async def key_check(
     dark = await asyncio.to_thread(meter.read, off, box)
     floor = LIT_SHARE * max(meter.to_linear(level, profile) for level in dark.sides)
     if max(sides) <= floor or max(sides) <= 0:
-        return KeyCheck(sides, None)
-    return KeyCheck(sides, "left" if sides[0] > sides[1] else "right")
+        return KeyCheck(sides, None, on, off)
+    return KeyCheck(sides, "left" if sides[0] > sides[1] else "right", on, off)

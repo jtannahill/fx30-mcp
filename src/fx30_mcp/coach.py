@@ -36,7 +36,7 @@ from .plan import (
     ratio_light,
     window_light,
 )
-from .survey import Survey, key_check, survey
+from .survey import KeyCheck, Survey, key_check, survey
 
 CARD_TOLERANCE = 1 / 3  # stops the window may sit off its range before the card is redone
 MAX_RECOMPUTES = 4
@@ -348,7 +348,25 @@ class Coach:
             elif far > near * 2**UNEVEN_STOPS:
                 instruction, detail = "Key is on the wrong side", f"Move it to camera-{side}."
             else:
-                return  # a soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong
+                # A soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong.
+                await self._catchlight_step(check)
+                return
+
+    async def _catchlight_step(self, check: KeyCheck) -> None:
+        """Best effort, asked once: say so when the key's reflection in the eyes is low or missing."""
+
+        verdict = await asyncio.to_thread(meter.catchlight, check.on, check.off, self.curve)
+        if verdict == "raise":
+            asked = ("Raise the key", "The catchlight is low in your eyes.")
+        elif verdict == "lower":
+            asked = ("Lower the key a little", "There's no catchlight in your eyes.")
+        else:
+            return
+
+        def better(_reading: meter.Reading) -> bool:
+            return meter.catchlight(self.latest_frame, check.off, self.curve) in ("ok", None)
+
+        await self._wait("place_key", *asked, better)
 
     async def _move_key(self, instruction: str, under: float, done: Callable[[meter.Reading], bool]) -> None:
         """Ask for the key nearer or farther, wait until the face shows it, and note where it went."""
