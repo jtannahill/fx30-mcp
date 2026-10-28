@@ -155,6 +155,22 @@ def test_camera_card_brightening_returns_shutter_first():
     assert (card.aperture, card.shutter) == ("f/11", "1/60")
 
 
+def test_camera_card_trades_a_fast_shutter_for_aperture():
+    # 1/400 is eight thirds over 1/60: at the same exposure that is f/7.1 at 1/60.
+    card = camera_card(current("f/2.8", "1/400"), 0, 29.97, 2.8, True)
+    assert (card.aperture, card.shutter, card.iso, card.note) == ("f/7.1", "1/60", "800", None)
+
+
+def test_camera_card_trade_stops_at_f16_and_keeps_the_rest_in_the_shutter():
+    # The owner's Oct 28 state: f/11 at 1/400 would need about f/22 at 1/60, past f/16.
+    card = camera_card(current("f/11", "1/400"), 0, 29.97, 2.8, True)
+    assert (card.aperture, card.shutter) == ("f/16", "1/200")
+    assert "ND" in card.note
+    assert exposure_of(card.iso, card.shutter, card.aperture) == pytest.approx(
+        exposure_of("800", "1/400", "f/11"), abs=0.1
+    )
+
+
 def test_camera_card_never_wider_than_the_lens():
     card = camera_card(current("f/16", "1/250"), 12, 29.97, 4.0, True)
     assert (card.aperture, card.shutter) == ("f/4", "1/60")

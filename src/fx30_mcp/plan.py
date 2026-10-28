@@ -136,6 +136,10 @@ def camera_card(current: dict[str, Any], stops: float, frame_rate: float, widest
     shutter = _nearest(denominators, _shutter_value(str(current["shutter"])))
     aperture = _nearest(APERTURES, float(str(current["aperture"]).lstrip("fF/")))
     open_limit = min(i for i, f in enumerate(APERTURES) if f >= max(widest, 2.8) - 1e-6)
+    # A shutter above base goes back to base first, the aperture closing to match, as far as f/16.
+    traded = max(0, min(shutter - base, STOP_APERTURE - aperture))
+    shutter -= traded
+    aperture += traded
     # ISO goes back to base, so whatever the current ISO was adding comes off the move.
     thirds = round(3 * (stops + math.log2(float(current["iso"]) / 800)))
     iso = "800"
