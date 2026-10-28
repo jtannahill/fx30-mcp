@@ -2,11 +2,12 @@ import asyncio
 
 import pytest
 
+from fx30_mcp import coach as coach_module
 from fx30_mcp import config, meter
 from fx30_mcp.camera import WEDGED_HINT, CameraError
 from fx30_mcp.coach import Coach
 from fx30_mcp.config import Settings
-from fx30_mcp.plan import fmt_ft
+from fx30_mcp.plan import exposure_of, fmt_ft
 from fx30_mcp.sim import SimCamera, SimLight
 
 SIM_FACE = (100 / 320, 40 / 180, 120 / 320, 100 / 180)
@@ -326,3 +327,204 @@ def test_stop_before_begin():
     asyncio.run(go())
     assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
     assert coach.running is False
+
+
+def readback(camera, **forms):
+    """Make the camera report its settings in other forms, or None, as a real one may."""
+
+    real = camera.settings
+
+    async def settings():
+        return {**await real(), **forms}
+
+    camera.settings = settings
+
+
+def test_iso_read_with_words_reaches_ready():
+    camera, key = sim()
+    readback(camera, iso="ISO 800")
+    settings = Settings(key_modifier="softbox", key_size_in=24)
+    coach, states = coach_for(camera, key, settings)
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    assert states[-1]["step"] == "ready"
+    assert settings.key_output["exposure"] == pytest.approx(exposure_of("800", "1/60", SETTLED), abs=0.01)
+
+
+def test_unreadable_aperture_is_asked_for_with_a_tap():
+    camera, key = sim()
+    readback(camera, aperture=None)
+    settings = Settings(key_modifier="softbox", key_size_in=24)
+    coach, states = coach_for(camera, key, settings)
+
+    async def set_it_and_tap():
+        while True:
+            state = coach.state
+            if state.get("detail") == "Tap when it's set.":
+                value = state["instruction"].split()[1]
+                if camera.values["aperture"] != value:
+                    camera.values["aperture"] = value
+                    coach.light_in_place()
+            await asyncio.sleep(0)
+
+    walk(coach, set_it_and_tap(), when(coach, at("place_key"), coach.light_in_place))
+    assert any(s["detail"] == "Tap when it's set." and s["step"] == "camera" for s in states)
+    assert states[-1]["step"] == "ready" and states[-1]["lights"]["face"] == "green"
+    assert settings.key_output is None  # the exposure is not known, so nothing is learned
+
+
+def test_strong_key_says_farther_then_balances():
+    camera, key = sim(stops_at_full=7.5, curve=1.0)
+    key.state.brightness = 2
+    coach, states = coach_for(camera, key)
+    farther = at("balance", "Key farther")
+
+    def move_back():
+        camera.key_distance_ft = 12.0
+
+    walk(coach, when(coach, at("place_key"), coach.light_in_place), when(coach, farther, move_back))
+    shown = next(s for s in states if farther(s))
+    assert shown["detail"].startswith("4 ft to ")
+    assert states[-1]["step"] == "ready" and states[-1]["lights"]["face"] == "green"
+    assert coach.plan.geometry.distance_ft > 4
+
+
+def test_window_clipping_after_balance_goes_back_to_the_camera():
+    camera, key = sim()
+    real = camera.describe
+
+    async def picture_profile_off():
+        return {**await real(), "picture_profile": "Off", "gamma": "Rec709"}  # window judged truthfully
+
+    camera.describe = picture_profile_off
+    coach, states = coach_for(camera, key)
+
+    def brighter_sky():
+        camera.window = 16.0
+
+    walk(
+        coach,
+        when(coach, at("place_key"), coach.light_in_place),
+        when(coach, at("balance"), brighter_sky),
+        when(coach, at("camera"), coach.stop),
+    )
+    steps = [s["step"] for s in states if s["screen"] == "coach"]
+    assert "ready" not in steps
+    asked = next(s for s in states if s["screen"] == "coach" and s["step"] == "camera")
+    assert asked["instruction"].startswith("Set f/") and asked["instruction"] != f"Set {SETTLED} on the camera"
+    assert steps.index("camera") > steps.index("balance")
+
+
+@pytest.mark.parametrize(
+    "spill, instruction, detail",
+    [
+        (0.2, "Fill closer", "Or bounce the key off a white card on the shadow side."),
+        (1.0, "Fill farther", "Or turn the fill off."),
+    ],
+)
+def test_fill_at_its_limit_says_move_it(spill, instruction, detail):
+    fill = SimLight()
+    camera, key = sim(key_spill=spill, fill=fill, fill_gain=0.0)  # the fill reaches nothing: always at a limit
+    coach, states = coach_for(camera, key, fill=fill)
+    told = at("balance", instruction)
+    walk(
+        coach,
+        when(coach, at("place_key", "Key on camera-left"), coach.light_in_place),
+        when(coach, at("place_key", "Fill on camera-right"), coach.light_in_place),
+        when(coach, told, coach.stop),
+    )
+    assert next(s for s in states if told(s))["detail"] == detail
+
+
+def test_unexpected_error_says_so_and_reraises():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+
+    async def broken():
+        raise RuntimeError("bug")
+
+    async def go():
+        await coach.start()
+        camera.settings = broken
+        coach.begin()
+        await coach.run()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(go())
+    assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
+    assert states[-1]["detail"] == "Something went wrong: RuntimeError."
+    assert coach.running is False
+
+
+def test_stop_during_balance_is_not_overwritten():
+    camera, key = sim()
+    settings = Settings(key_modifier="softbox", key_size_in=24)
+    coach, states = coach_for(camera, key, settings)
+    real = key.set_white
+
+    async def set_white(*args, **kwargs):
+        coach.stop()
+        await real(*args, **kwargs)
+
+    key.set_white = set_white
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
+    assert settings.key_output is None and not config.SETTINGS_PATH.exists()
+
+
+def test_light_error_without_a_message_names_it():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+
+    async def broken(*_args, **_kwargs):
+        raise ValueError()
+
+    key.set_white = broken
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    assert (states[-1]["instruction"], states[-1]["detail"]) == ("A light stopped answering", "ValueError")
+
+
+def test_key_closer_without_a_face_keeps_the_plan_distance(monkeypatch):
+    camera, key = sim(stops_at_full=-1.0)
+    coach, _states = coach_for(camera, key, Settings(key_modifier="softbox", key_size_in=24))
+
+    async def walk_off_then_stop():
+        while not at("balance", "Key closer")(coach.state):
+            await asyncio.sleep(0)
+        monkeypatch.setattr(meter, "find_face", lambda _jpeg: None)
+        for _ in range(2):  # a frame already being read may have found the face
+            frame = coach.latest_frame
+            while coach.latest_frame is frame:
+                await asyncio.sleep(0)
+        coach.light_in_place()
+        while not at("balance", "Hold still")(coach.state):
+            await asyncio.sleep(0)
+        coach.stop()
+
+    walk(coach, when(coach, at("place_key"), coach.light_in_place), walk_off_then_stop())
+    assert coach.plan.geometry.distance_ft == 2.5
+
+
+def test_window_clipping_with_the_card_at_its_darkest_says_so(monkeypatch):
+    camera, key = sim()
+    real = camera.describe
+
+    async def picture_profile_off():
+        return {**await real(), "picture_profile": "Off", "gamma": "Rec709"}
+
+    camera.describe = picture_profile_off
+    coach, states = coach_for(camera, key)
+
+    def brighter_sky_and_no_darker_card():
+        camera.window = 16.0
+        same = coach.plan
+        monkeypatch.setattr(coach_module, "make_plan", lambda *_args, **_kwargs: same)
+
+    hopeless = at("balance", "The key can't hold this window right now")
+    walk(
+        coach,
+        when(coach, at("place_key"), coach.light_in_place),
+        when(coach, at("balance"), brighter_sky_and_no_darker_card),
+        when(coach, hopeless, coach.stop),
+    )
+    assert any(hopeless(s) for s in states)
+    assert not any(s["step"] == "ready" for s in states)

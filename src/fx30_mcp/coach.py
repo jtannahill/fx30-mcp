@@ -20,7 +20,7 @@ import math
 from typing import Any, Awaitable, Callable
 
 from . import config, meter
-from .balance import STOP_TOLERANCE, balance
+from .balance import MIN_BRIGHTNESS, STOP_TOLERANCE, balance
 from .camera import WEDGED_HINT, CameraBase, CameraError
 from .config import Settings
 from .plan import (
@@ -41,7 +41,9 @@ from .survey import Survey, key_check, survey
 CARD_TOLERANCE = 1 / 3  # stops the window may sit off its range before the card is redone
 MAX_RECOMPUTES = 4
 LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO"}  # asked in this order
+ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from when the camera cannot say
 CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
+HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
 
 
 class LightError(Exception):
@@ -65,7 +67,7 @@ class _Light:
             except CameraError:
                 raise
             except Exception as err:
-                raise LightError(str(err)) from err
+                raise LightError(str(err) or type(err).__name__) from err
 
         return call
 
@@ -91,13 +93,26 @@ def _number(setting: str, text: Any) -> float | None:
         return None
 
 
-def _matches(setting: str, current: Any, wanted: str) -> bool:
-    if current is None:
-        return True  # the camera does not report it, so there is nothing to wait for
-    have, want = _number(setting, current), _number(setting, wanted)
-    if have is None or want is None:
-        return str(current) == wanted
-    return math.isclose(have, want, rel_tol=0.02)
+def _canonical(setting: str, value: Any) -> str | None:
+    """One form for a camera value: "800", "1/60", "f/6.3". None when the camera did not report it;
+    text that is not a number comes back as it is, so it never matches a card."""
+
+    if value is None:
+        return None
+    number = _number(setting, value)
+    if number is None:
+        return str(value)
+    if setting == "aperture":
+        return f"f/{number:g}"
+    if setting == "shutter" and 0 < number < 1 and math.isclose(1 / number, round(1 / number), rel_tol=0.01):
+        return f"1/{round(1 / number)}"
+    return f"{number:g}"
+
+
+def _numeric(readback: dict[str, str | None]) -> bool:
+    """Every card setting was read and is a number, so it can go into a plan or an exposure."""
+
+    return all(readback[s] is not None and _number(s, readback[s]) is not None for s in LABELS)
 
 
 class Coach:
@@ -154,6 +169,10 @@ class Coach:
         """Survey with the lights off and plan; None, asking them to sit in the shot, without a face."""
 
         found = await survey(self.camera, self.key, self.fill, self.curve, self.settle, self.sleep)
+        readback = {s: _canonical(s, found.camera.get(s)) for s in LABELS}
+        # A setting the camera cannot report is planned from the base; the camera step asks for it anyway.
+        plannable = {s: v if _number(s, v) is not None else ASSUMED[s] for s, v in readback.items()}
+        found = dataclasses.replace(found, camera={**found.camera, **plannable})
         self._survey = found
         self.latest_frame = found.frame
         self._truthful = self.curve == "slog3" or (found.info.get("gamma") == "Rec709" and self.curve == "rec709")
@@ -180,8 +199,13 @@ class Coach:
             await self._place_key()
             if self.fill is not None:
                 await self._wait("place_key", f"Fill on camera-{self.plan.fill_side}", "Next to the lens. Tap when it's there.")
-            await self._balance_step()
-            await self._look()
+            while not await self._balance_step():
+                # The window clips: darken the card. When it is as dark as it goes, the glass needs taming.
+                card = self.plan.camera
+                await self._camera_step()
+                if self.plan.camera == card:
+                    await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, self._window_holds)
+            self._check()
             self._show("ready", "Ready to record", None)
         except _Stopped:
             self._show("stopped", "Coach stopped", None)
@@ -189,6 +213,9 @@ class Coach:
             self._show("stopped", "Camera stopped answering", WEDGED_HINT)
         except LightError as err:
             self._show("stopped", "A light stopped answering", str(err))
+        except Exception as err:
+            self._show("stopped", "Coach stopped", f"Something went wrong: {type(err).__name__}.")
+            raise
         finally:
             self.running = False
 
@@ -211,10 +238,9 @@ class Coach:
 
     def _judge(self, reading: meter.Reading, window: meter.Window | None) -> None:
         self._window = window
-        stops = meter.stops_off(reading.lit, self.settings.target, self.curve)
         contrast = reading.contrast(self.curve) if self.fill is not None and reading.face else None
         self._lights = {
-            "face": face_light(stops),
+            "face": face_light(self._under(reading)),
             "window": window_light(window, reading.lit, self.curve, self._truthful),
             "ratio": ratio_light(contrast, self.settings.fill_ratio),
         }
@@ -232,7 +258,16 @@ class Coach:
         return reading
 
     def _under(self, reading: meter.Reading) -> float:
+        """Stops the face sits under target; negative when over."""
+
         return meter.stops_off(reading.lit, self.settings.target, self.curve)
+
+    def _window_holds(self, _reading: meter.Reading) -> bool:
+        return self._lights["window"] != "red"
+
+    async def _readback(self) -> dict[str, str | None]:
+        raw = await self.camera.settings()
+        return {s: _canonical(s, raw.get(s)) for s in LABELS}
 
     async def _wait(
         self,
@@ -257,26 +292,41 @@ class Coach:
         return reading
 
     async def _camera_step(self) -> None:
-        """Ask for each card setting until the readback matches; redo the card while the window is off."""
+        """Ask for each card setting until the readback matches; redo the card while the window is off.
+
+        A setting the camera does not report is asked for once and taken as set when they tap."""
 
         recomputes = 0
+        tapped: dict[str, str] = {}
         while True:
             self._check()
-            current = await self.camera.settings()
+            current = await self._readback()
             await self._look()
             card = self.plan.camera
-            wrong = next((s for s in LABELS if not _matches(s, current.get(s), getattr(card, s))), None)
+            wanted = {s: _canonical(s, getattr(card, s)) for s in LABELS}
+            wrong = next(
+                (s for s in LABELS if current[s] != wanted[s] and not (current[s] is None and tapped.get(s) == wanted[s])),
+                None,
+            )
+            if wrong is not None and current[wrong] is None:
+                await self._wait("camera", f"Set {wanted[wrong]} on the camera", "Tap when it's set.")
+                tapped[wrong] = wanted[wrong]
+                continue
             if wrong is not None:
                 detail = LABELS[wrong] if card.note is None else f"{LABELS[wrong]}. {card.note}"
-                self._show("camera", f"Set {getattr(card, wrong)} on the camera", detail)
+                self._show("camera", f"Set {wanted[wrong]} on the camera", detail)
                 await self.sleep(self.settle)
                 continue
             change = exposure_change(self._window, self.settings.target, self.curve, self.settings.window_range)
             if abs(change) <= CARD_TOLERANCE or recomputes >= MAX_RECOMPUTES:
                 return
             recomputes += 1
-            seen = dataclasses.replace(self._survey, camera=current, window=self._window)
-            self.plan = make_plan(seen, self.settings, self.override)
+            seen = {s: current[s] if current[s] is not None else wanted[s] for s in LABELS}
+            self.plan = make_plan(
+                dataclasses.replace(self._survey, camera={**self._survey.camera, **seen}, window=self._window),
+                self.settings,
+                self.override,
+            )
 
     async def _place_key(self) -> None:
         geometry = self.plan.geometry
@@ -297,11 +347,23 @@ class Coach:
             else:
                 return  # a soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong
 
-    async def _balance_step(self) -> None:
-        """Balance; with the key at full and the face still under, ask for it closer and balance again."""
+    async def _move_key(self, instruction: str, under: float, done: Callable[[meter.Reading], bool]) -> None:
+        """Ask for the key nearer or farther, wait until the face shows it, and note where it went."""
+
+        d0 = self.plan.geometry.distance_ft
+        reading = await self._wait("balance", instruction, f"{fmt_ft(d0)} to {fmt_ft(closer(d0, under))}", done)
+        if reading is not None and reading.face:
+            # Half the distance is two stops: read how far it moved from how much the face changed.
+            self.plan.geometry.distance_ft = closer(d0, under - self._under(reading))
+
+    async def _balance_step(self) -> bool:
+        """Balance once and judge it: True at Ready, False when the window clips and the card must darken.
+
+        A limit balance cannot get past becomes one instruction; once the frame shows it was followed,
+        or they tap, it balances again."""
 
         while True:
-            self._show("balance", "Hold still", "Setting the light on your face.")
+            self._show("balance", *HOLD_STILL)
             result = await balance(
                 self.camera,
                 self.key,
@@ -312,25 +374,39 @@ class Coach:
                 fill=self.fill,
                 target=self.settings.target,
             )
-            await self._save_key_output(result)
             self._check()
+            await self._save_key_output(result)
+            await self._look()
             last = result["steps"][-1]
-            under = last["stops"]
-            if result["light"]["brightness"] < 100 or under <= STOP_TOLERANCE or not last["face"]:
-                return
-            # Moving the key or opening up shows as a brighter face; then balance again.
-            def enough(reading: meter.Reading) -> bool:
+            under, key = last["stops"], result["light"]["brightness"]
+            fill = result.get("fill")
+
+            def no_longer_under(reading: meter.Reading) -> bool:
                 return self._under(reading) <= STOP_TOLERANCE
 
-            d0 = self.plan.geometry.distance_ft
-            d1 = closer(d0, under)
-            if d1 < MIN_KEY_FT:
-                await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, enough)
-                continue
-            reading = await self._wait("balance", "Key closer", f"{fmt_ft(d0)} to {fmt_ft(d1)}", enough)
-            if reading is not None:
-                # Half the distance is two stops: read how far it moved from how much brighter the face is.
-                self.plan.geometry.distance_ft = closer(d0, under - self._under(reading))
+            def no_longer_over(reading: meter.Reading) -> bool:
+                return self._under(reading) >= -STOP_TOLERANCE
+
+            def ratio_green(_reading: meter.Reading | None) -> bool:
+                return self._lights["ratio"] == "green"
+
+            if last["face"] and key >= 100 and under > STOP_TOLERANCE:
+                if closer(self.plan.geometry.distance_ft, under) < MIN_KEY_FT:
+                    await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, no_longer_under)
+                else:
+                    await self._move_key("Key closer", under, no_longer_under)
+            elif last["face"] and key <= MIN_BRIGHTNESS and under < -STOP_TOLERANCE:
+                await self._move_key("Key farther", under, no_longer_over)
+            elif fill is not None and fill["advice"] is not None and fill["ratio"] is not None and not ratio_green(None):
+                if fill["ratio"] > fill["ratio_target"]:
+                    await self._wait("balance", "Fill closer", "Or bounce the key off a white card on the shadow side.", ratio_green)
+                else:
+                    await self._wait("balance", "Fill farther", "Or turn the fill off.", ratio_green)
+            elif self._lights["window"] == "red":
+                return False
+            elif self._lights["face"] == "green":
+                return True
+            # Otherwise balance ran out of readings short of target: go again.
 
     async def _save_key_output(self, result: dict[str, Any]) -> None:
         """Remember what the key does at full from where it is, for the next plan's key percent."""
@@ -338,7 +414,10 @@ class Coach:
         last = result["steps"][-1]
         if not last["face"]:
             return
-        current = await self.camera.settings()
+        current = await self._readback()
+        if not _numeric(current):
+            return
+        self._check()
         brightness = result["light"]["brightness"]
         self.settings.key_output = {
             "modifier": self.settings.key_modifier,
