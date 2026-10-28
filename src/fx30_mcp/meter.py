@@ -178,3 +178,99 @@ def read(jpeg: bytes, box: Box | None = None) -> Reading:
 
 def _luma(pixels: np.ndarray) -> np.ndarray:
     return 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
+
+
+@dataclass
+class Window:
+    level: float  # median luma of the bright pixels, 0..1 as live view encodes it
+    clipped: float  # share of the window at or above CLIP_LEVEL
+    box: Box  # bounding box of the bright pixels
+    side: str  # "left", "right" or "center" of the frame
+    blue: float  # mean (b - luma) * 0.564 over the window: positive reads as daylight
+
+
+def _decode(jpeg: bytes) -> np.ndarray:
+    return np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"), dtype=float) / 255
+
+
+def find_window(jpeg: bytes, face_box: Box | None, profile: str) -> Window | None:
+    """The bright patch behind the subject, if there is one.
+
+    Leaves out the face (widened 1.6x) and everything below it, so skin and
+    shoulders are never taken for a window. Bright means at least 4x the
+    light of the wall (the darker quarter of what is left, since a window can
+    fill half of the strip beside the head) and at least mid grey."""
+
+    rgb = _decode(jpeg)
+    height, width, _ = rgb.shape
+    linear = np.asarray(PROFILES[profile][0](_luma(rgb.reshape(-1, 3))), dtype=float).reshape(height, width)
+    considered = np.ones((height, width), dtype=bool)
+    if face_box is not None:
+        x, y, w, h = face_box
+        left, right = x - w * 0.3, x + w * 1.3
+        considered[int(math.ceil((y + h) * height)) :, :] = False
+        considered[:, max(0, int(left * width)) : int(math.ceil(right * width))] = False
+    if not considered.any():
+        return None
+    bright = considered & (linear >= max(4 * np.percentile(linear[considered], 25), to_linear(0.5, profile)))
+    if bright.mean() < 0.05:
+        return None
+    ys, xs = np.nonzero(bright)
+    pixels = rgb[bright]
+    luma = _luma(pixels)
+    centre = float(xs.mean()) / width
+    side = "left" if centre < 0.4 else "right" if centre > 0.6 else "center"
+    box = (xs.min() / width, ys.min() / height, (xs.max() + 1 - xs.min()) / width, (ys.max() + 1 - ys.min()) / height)
+    return Window(
+        level=float(np.median(luma)),
+        clipped=float(np.mean(luma >= CLIP_LEVEL)),
+        box=box,
+        side=side,
+        blue=float(np.mean((pixels[:, 2] - luma) * 0.564)),
+    )
+
+
+def face_yaw(jpeg: bytes) -> float | None:
+    """How far the head is turned, in degrees; positive means the nose points to
+    frame-right, so the far cheek is on frame-left. None without a face.
+
+    Revision 3 of Vision's face rectangles reports yaw. The sign here follows
+    Apple's documentation; it is confirmed on hardware in a later task."""
+
+    import Vision
+    from Foundation import NSData, NSDictionary
+
+    data = NSData.dataWithBytes_length_(jpeg, len(jpeg))
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, NSDictionary.dictionary())
+    request = Vision.VNDetectFaceRectanglesRequest.alloc().init()
+    revision = getattr(Vision, "VNDetectFaceRectanglesRequestRevision3", None)
+    if revision is not None:
+        request.setRevision_(revision)
+    ok, error = handler.performRequests_error_([request], None)
+    if not ok:
+        raise ValueError(f"live view frame is not a readable image: {error}")
+    faces = list(request.results() or [])
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height)
+    yaw = face.yaw()
+    return None if yaw is None else math.degrees(float(yaw))
+
+
+def key_only(on: bytes, off: bytes, box: Box, profile: str) -> tuple[float, float]:
+    """Linear light the key adds to the left and right halves of the inner face:
+    the frame with the key on, less the same frame with it off."""
+
+    def halves(jpeg: bytes) -> list[float]:
+        rgb = _decode(jpeg)
+        height, width, _ = rgb.shape
+        x, y, w, h = _inner(box)
+        left, top = int(x * width), int(y * height)
+        right, bottom = max(left + 2, int((x + w) * width)), max(top + 1, int((y + h) * height))
+        region = np.asarray(PROFILES[profile][0](_luma(rgb[top:bottom, left:right].reshape(-1, 3))), dtype=float)
+        region = region.reshape(bottom - top, right - left)
+        middle = region.shape[1] // 2
+        return [region[:, :middle], region[:, middle:]]
+
+    added = [np.median(np.maximum(a - b, 0)) for a, b in zip(halves(on), halves(off))]
+    return float(added[0]), float(added[1])
