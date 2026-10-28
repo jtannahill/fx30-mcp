@@ -45,6 +45,8 @@ ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from
 CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
 DARKEST = ("The camera can't darken this window any further", "ND film or a sheer curtain on the glass would.")
 HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
+NO_FACE = ("Sit in the shot", "The coach needs your face in the frame to plan.")
+WORKING_PERCENT = 50  # the key's level for the key check when no percent was predicted
 RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
 
 
@@ -185,7 +187,7 @@ class Coach:
         self._judge(found.reading, found.window)
         if not found.reading.face:
             self.plan = None
-            self._show("camera", "Sit in the shot", "The coach needs your face in the frame to plan.", screen="plan")
+            self._show("camera", *NO_FACE, screen="plan")
             return None
         self._box = found.reading.box
         self.plan = make_plan(found, self.settings, self.override)
@@ -252,7 +254,7 @@ class Coach:
         self._window = window
         contrast = reading.contrast(self.curve) if self.fill is not None and reading.face else None
         self._lights = {
-            "face": face_light(self._under(reading)),
+            "face": face_light(self._under(reading)) if reading.face else "red",
             "window": window_light(window, reading.lit, self.curve, self._truthful),
             "ratio": ratio_light(contrast, self.settings.fill_ratio),
         }
@@ -346,6 +348,7 @@ class Coach:
                 dataclasses.replace(self._survey, camera={**self._survey.camera, **seen}, window=self._window),
                 self.settings,
                 self.override,
+                geometry=self.plan.geometry,  # keeps a distance _move_key measured
             )
 
     async def _place_key(self) -> None:
@@ -358,6 +361,9 @@ class Coach:
         )
         while True:
             await self._wait("place_key", instruction, detail)
+            # A key left dim would look like no key at all: the check measures it at a working level.
+            await self.key.set_power(True)
+            await self.key.set_white(self.plan.kelvin, self.plan.key_percent or WORKING_PERCENT)
             check = await key_check(self.camera, self.key, self._box, self.curve, self.settle, self.sleep)
             near, far = check.sides if side == "left" else reversed(check.sides)
             if check.lit is None:
@@ -403,6 +409,7 @@ class Coach:
 
         while True:
             self._show("balance", *HOLD_STILL)
+            sign = self.settings.tint_sign
             result = await balance(
                 self.camera,
                 self.key,
@@ -414,8 +421,10 @@ class Coach:
                 target=self.settings.target,
             )
             self._check()
+            if self.settings.tint_sign != sign:
+                self._save_tint_sign()
             await self._save_key_output(result)
-            await self._look()
+            reading = await self._look()
             last = result["steps"][-1]
             under, key = last["stops"], result["light"]["brightness"]
             fill = result.get("fill")
@@ -429,7 +438,9 @@ class Coach:
             def ratio_green(_reading: meter.Reading | None) -> bool:
                 return self._lights["ratio"] == "green"
 
-            if last["face"] and key >= 100 and under > STOP_TOLERANCE:
+            if not reading.face:
+                await self._wait("balance", *NO_FACE, lambda seen: seen.face)
+            elif last["face"] and key >= 100 and under > STOP_TOLERANCE:
                 if closer(self.plan.geometry.distance_ft, under) < MIN_KEY_FT:
                     await self._wait("balance", "The key can't hold this window right now", CANT_HOLD, no_longer_under)
                 else:
@@ -446,6 +457,13 @@ class Coach:
             elif self._lights["face"] == "green":
                 return True
             # Otherwise balance ran out of readings short of target: go again.
+
+    def _save_tint_sign(self) -> None:
+        """Balance learned this light counts tint the other way: keep that, and only that."""
+
+        saved = config.load()
+        saved.tint_sign = self.settings.tint_sign
+        config.save(saved)
 
     async def _save_key_output(self, result: dict[str, Any]) -> None:
         """Remember what the key does at full from where it is, for the next plan's key percent."""

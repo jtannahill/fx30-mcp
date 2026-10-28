@@ -615,3 +615,95 @@ def test_recording_seen_by_the_coach_stops_it():
     )
     assert frames == []
     assert coach.running is False
+
+
+def test_no_face_lights_the_face_red():
+    camera, key = sim()
+    coach, _states = coach_for(camera, key)
+    # The middle of the frame sits right at the face target, but nobody is in the shot.
+    empty = meter.Reading(face=False, box=SIM_FACE, level=Settings().target, clipped=0.0, hue=None, chroma=0.0)
+    coach._judge(empty, None)
+    assert coach._lights["face"] == "red"
+
+
+def test_no_face_during_balance_asks_to_sit_in_the_shot(monkeypatch):
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    sit = at("balance", "Sit in the shot")
+
+    def leave():
+        monkeypatch.setattr(meter, "find_face", lambda _jpeg: None)
+
+    def come_back():
+        monkeypatch.setattr(meter, "find_face", lambda _jpeg: SIM_FACE)
+
+    walk(
+        coach,
+        when(coach, at("place_key"), coach.light_in_place),
+        when(coach, at("balance", "Hold still"), leave),
+        when(coach, sit, come_back),
+    )
+    shown = next(s for s in states if sit(s))
+    assert shown["detail"] == "The coach needs your face in the frame to plan."
+    assert shown["lights"]["face"] == "red"
+    assert states[-1]["step"] == "ready"
+
+
+def test_a_new_card_keeps_the_measured_key_distance():
+    camera, key = sim()
+    real = camera.describe
+
+    async def picture_profile_off():
+        return {**await real(), "picture_profile": "Off", "gamma": "Rec709"}
+
+    camera.describe = picture_profile_off
+    coach, _states = coach_for(camera, key, Settings(key_modifier="softbox", key_size_in=24))
+
+    async def follow_the_card():
+        while True:
+            card = coach.plan.camera
+            camera.values.update(iso=card.iso, shutter=card.shutter, aperture=card.aperture)
+            await asyncio.sleep(0)
+
+    async def go():
+        await coach.start()
+        coach.plan.geometry.distance_ft = 1.75  # where _move_key measured the key
+        before = coach.plan.camera
+        camera.window = 16.0  # the window now clips: the card is redone
+        follower = asyncio.create_task(follow_the_card())
+        try:
+            await asyncio.wait_for(coach._camera_step(), 10)
+        finally:
+            follower.cancel()
+        assert coach.plan.camera != before
+        assert coach.plan.geometry.distance_ft == 1.75 and coach.plan.geometry.side == "left"
+
+    asyncio.run(go())
+
+
+def test_a_tint_flip_learned_during_the_coach_is_saved():
+    camera, key = sim(green_cast=0.12, tint_sign=-1)
+    settings = Settings()
+    coach, _states = coach_for(camera, key, settings)
+
+    def owner_saves_a_target_then_places_the_light():
+        saved = config.load()
+        saved.face_level = 0.58
+        config.save(saved)
+        coach.light_in_place()
+
+    walk(coach, when(coach, at("place_key"), owner_saves_a_target_then_places_the_light))
+    assert settings.tint_sign == -1
+    saved = config.load()
+    assert saved.tint_sign == -1 and saved.face_level == 0.58
+
+
+def test_a_dim_key_is_turned_up_before_the_key_check():
+    camera, key = sim()
+    key.state.brightness = 1  # on, but too dim for the check to see
+    coach, states = coach_for(camera, key)
+    off = at("place_key", "Turn the key on")
+    walk(coach, when(coach, at("place_key"), coach.light_in_place), when(coach, off, coach.stop))
+    assert not any(off(s) for s in states)
+    assert (coach.plan.kelvin, 50, 0) in key.writes
+    assert states[-1]["step"] == "ready"

@@ -239,9 +239,18 @@ def _widest_offered(apertures: list[Any]) -> float | None:
     return min(numbers, default=None)
 
 
-def make_plan(survey: Survey, settings: Settings, override: str | None = None) -> Plan:
+def make_plan(
+    survey: Survey,
+    settings: Settings,
+    override: str | None = None,
+    geometry: Geometry | None = None,
+) -> Plan:
+    """The plan for a survey; given a geometry (where the key already is), the key stays there."""
+
     side, why = choose_key_side(survey.yaw, survey.ambient, settings.profile, override)
-    geometry = key_geometry(side, settings.key_modifier, settings.key_size_in)
+    if geometry is None:
+        geometry = key_geometry(side, settings.key_modifier, settings.key_size_in)
+    side = geometry.side
     frame_rate = survey.info.get("frame_rate") or settings.frame_rate or 29.97
     lens = _widest_offered(survey.info.get("apertures") or [])
     widest = settings.widest_aperture or lens or 2.8
