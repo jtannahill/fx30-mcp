@@ -320,7 +320,10 @@ def catchlight(on: bytes, off: bytes, profile: str = "rec709") -> str | None:
     Best effort. The spot is the brightest point the key adds inside a small box
     around each pupil, and it must stand well clear of the rest of the box."""
 
-    found = _pupils(on)
+    try:
+        found = _pupils(on)
+    except ValueError:
+        return None  # an unreadable frame is no reason to stop the key step
     if found is None:
         return None
     face, pupils = found
@@ -329,10 +332,10 @@ def catchlight(on: bytes, off: bytes, profile: str = "rec709") -> str | None:
     half = max(face[2] * width / 6, 0) / 2
     if half * 2 < MIN_EYE_PX or dark.shape != lit.shape:
         return None
-    added = np.maximum(
-        np.asarray(PROFILES[profile][0](_luma(lit.reshape(-1, 3))), dtype=float)
-        - np.asarray(PROFILES[profile][0](_luma(dark.reshape(-1, 3))), dtype=float),
-        0,
+    to_lin = PROFILES[profile][0]
+    added = (
+        np.asarray(to_lin(_luma(lit.reshape(-1, 3))), dtype=float)
+        - np.asarray(to_lin(_luma(dark.reshape(-1, 3))), dtype=float)
     ).reshape(height, width)
     spots = []
     for fx, fy in pupils:

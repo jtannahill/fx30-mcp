@@ -565,7 +565,7 @@ def test_low_catchlight_says_raise_then_reaches_ready(monkeypatch):
     shown = next(s for s in states if s["instruction"] == "Raise the key")
     assert shown["detail"] == "The catchlight is low in your eyes."
     assert states[-1]["step"] == "ready"
-    assert len(calls) <= 3
+    assert len(calls) == 2  # the key check, then the one frame that shows it fixed
 
 
 def test_missing_catchlight_says_lower(monkeypatch):

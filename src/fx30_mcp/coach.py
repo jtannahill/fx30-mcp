@@ -277,9 +277,11 @@ class Coach:
         step: str,
         instruction: str,
         detail: str | None,
-        done: Callable[[meter.Reading], bool] | None = None,
+        done: Callable[[meter.Reading], bool | Awaitable[bool]] | None = None,
     ) -> meter.Reading | None:
-        """Show an instruction and keep the lights live until they tap, or done() says the frame is there."""
+        """Show an instruction and keep the lights live until they tap, or done() says the frame is there.
+
+        done() may be a coroutine function, for checks too slow to run on the event loop."""
 
         self._in_place.clear()
         self._show(step, instruction, detail)
@@ -288,8 +290,12 @@ class Coach:
             self._check()
             reading = await self._look()
             self._show(step, instruction, detail)
-            if done is not None and done(reading):
-                break
+            if done is not None:
+                finished = done(reading)
+                if inspect.isawaitable(finished):
+                    finished = await finished
+                if finished:
+                    break
             await self.sleep(self.settle)
         self._check()
         return reading
@@ -363,8 +369,9 @@ class Coach:
         else:
             return
 
-        def better(_reading: meter.Reading) -> bool:
-            return meter.catchlight(self.latest_frame, check.off, self.curve) in ("ok", None)
+        async def better(_reading: meter.Reading) -> bool:
+            frame = self.latest_frame
+            return await asyncio.to_thread(meter.catchlight, frame, check.off, self.curve) in ("ok", None)
 
         await self._wait("place_key", *asked, better)
 
