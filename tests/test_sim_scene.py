@@ -1,3 +1,5 @@
+import asyncio
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -35,7 +37,7 @@ def test_window_is_brighter_than_the_face():
 
 def test_key_off_leaves_only_ambient():
     light = SimLight()
-    light.set_power(False)
+    asyncio.run(light.set_power(False))
     reading = read(SimCamera(light, ambient=0.05, rim_side="right"))
     assert reading.sides[1] > reading.sides[0]
 

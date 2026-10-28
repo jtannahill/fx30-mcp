@@ -1,3 +1,4 @@
+import asyncio
 import sys
 
 import pytest
@@ -39,7 +40,7 @@ def test_key_only_finds_the_lit_side():
     light = SimLight()
     camera = SimCamera(light, key_side="left", ambient=0.05, rim_side="right", key_spill=0.2)
     on = camera.render()
-    light.set_power(False)
+    asyncio.run(light.set_power(False))
     off = camera.render()
     left, right = meter.key_only(on, off, SIM_FACE, camera.profile)
     assert left > right

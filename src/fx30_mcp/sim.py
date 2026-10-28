@@ -57,7 +57,7 @@ class SimLight:
         self.state.tint = tint
         self.writes.append((kelvin, self.state.brightness, tint))
 
-    def set_power(self, on: bool) -> None:
+    async def set_power(self, on: bool) -> None:
         self.state.power = on
 
     async def set_brightness(self, percent: float) -> None:
