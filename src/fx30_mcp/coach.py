@@ -48,17 +48,42 @@ HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
 NO_FACE = ("Sit in the shot", "The coach needs your face in the frame to plan.")
 WORKING_PERCENT = 50  # the key's level for the key check when no percent was predicted
 RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
+SLOW_LIGHT = 3.0  # seconds before a light call is said to be connecting
+CONNECTING = ("Connecting to the light", "This can take up to a minute.")
+UNREACHABLE = (
+    "The light isn't answering",
+    "If the amaran or Sidus Link app is open on your phone, close it or turn off the phone's Bluetooth, "
+    "then start the coach again.",
+)
 
 
 class LightError(Exception):
     """A light stopped answering: amaran Desktop closed, Bluetooth dropped, a bad reply."""
 
 
-class _Light:
-    """A light whose failures come out as LightError, so they are told apart from the coach's own."""
+class LightUnreachable(LightError):
+    """The light could not be reached over Bluetooth, most often because a phone app holds its one connection."""
 
-    def __init__(self, light: Any) -> None:
+
+def _unreachable(err: Exception) -> bool:
+    try:
+        from amaran_mcp.link import LinkError
+    except ImportError:
+        LinkError = ()  # noqa: N806
+    text = str(err).lower()
+    return isinstance(err, LinkError) or "could not connect" in text or "not advertising" in text
+
+
+class _Light:
+    """A light whose failures come out as LightError, so they are told apart from the coach's own.
+
+    A call still waiting after SLOW_LIGHT seconds is connecting: slow() is called then, and back()
+    once it returns."""
+
+    def __init__(self, light: Any, slow: Callable[[], None], back: Callable[[], None]) -> None:
         self._light = light
+        self._slow = slow
+        self._back = back
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._light, name)
@@ -66,12 +91,25 @@ class _Light:
             return value
 
         async def call(*args: Any, **kwargs: Any) -> Any:
+            fired: list[bool] = []
+
+            def slow() -> None:
+                fired.append(True)
+                self._slow()
+
+            timer = asyncio.get_running_loop().call_later(SLOW_LIGHT, slow)
             try:
-                return await value(*args, **kwargs)
+                result = await value(*args, **kwargs)
             except CameraError:
                 raise
             except Exception as err:
-                raise LightError(str(err) or type(err).__name__) from err
+                kind = LightUnreachable if _unreachable(err) else LightError
+                raise kind(str(err) or type(err).__name__) from err
+            finally:
+                timer.cancel()
+            if fired:
+                self._back()
+            return result
 
         return call
 
@@ -136,8 +174,8 @@ class Coach:
         override: str | None = None,
     ) -> None:
         self.camera = camera
-        self.key = _Light(key)
-        self.fill = None if fill is None else _Light(fill)
+        self.key = _Light(key, self._light_slow, self._light_back)
+        self.fill = None if fill is None else _Light(fill, self._light_slow, self._light_back)
         self.settings = settings
         self.publish = publish
         self.sleep = sleep
@@ -155,6 +193,7 @@ class Coach:
         self._begun = asyncio.Event()
         self._in_place = asyncio.Event()
         self._stopping = False
+        self._before_connecting: dict | None = None
 
     @property
     def curve(self) -> str:
@@ -222,6 +261,8 @@ class Coach:
         except CameraError as err:
             # The camera layer already says what to do: a timeout carries the power-cycle hint, others their own.
             self._show("stopped", "Camera stopped answering", str(err))
+        except LightUnreachable:
+            self._show("stopped", *UNREACHABLE)
         except LightError as err:
             self._show("stopped", "A light stopped answering", str(err))
         except Exception as err:
@@ -249,6 +290,17 @@ class Coach:
         if state != self.state:
             self.state = state
             self.publish(state)
+
+    def _light_slow(self) -> None:
+        """A light call is taking a while: most often the Bluetooth connect, which can run a minute."""
+
+        self._before_connecting = self.state
+        self._show(self.state.get("step", "camera"), *CONNECTING, screen=self.state.get("screen", "coach"))
+
+    def _light_back(self) -> None:
+        before, self._before_connecting = self._before_connecting, None
+        if before:
+            self._show(before["step"], before["instruction"], before["detail"], screen=before["screen"])
 
     def _judge(self, reading: meter.Reading, window: meter.Window | None) -> None:
         self._window = window

@@ -798,3 +798,56 @@ def test_a_dim_key_is_turned_up_before_the_key_check():
     assert (coach.plan.kelvin, 50, 0) in key.writes
     assert states[-1]["step"] == "ready"
 
+
+UNREACHABLE = (
+    "The light isn't answering",
+    "If the amaran or Sidus Link app is open on your phone, close it or turn off the phone's Bluetooth, "
+    "then start the coach again.",
+)
+
+
+def test_a_slow_light_says_connecting_then_carries_on(monkeypatch):
+    monkeypatch.setattr(coach_module, "SLOW_LIGHT", 0.01)
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    real = key.set_white
+    calls = []
+
+    async def slow_first(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            await asyncio.sleep(0.1)  # connecting over Bluetooth
+        await real(*args, **kwargs)
+
+    key.set_white = slow_first
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    shown = [(s["instruction"], s["detail"]) for s in states]
+    i = shown.index(("Connecting to the light", "This can take up to a minute."))
+    assert states[i + 1] == states[i - 1]  # back to what it showed before
+    assert shown.count(("Connecting to the light", "This can take up to a minute.")) == 1
+    assert states[-1]["step"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "LinkError",
+        RuntimeError("Found the light but could not connect ()"),
+        RuntimeError("The light is not advertising over Bluetooth. Is it on?"),
+    ],
+)
+def test_an_unreachable_light_says_close_the_phone_app(error):
+    if error == "LinkError":
+        from amaran_mcp.link import LinkError
+
+        error = LinkError("Lost the Bluetooth link to the light (timeout).")
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+
+    async def broken(*_args, **_kwargs):
+        raise error
+
+    key.set_white = broken
+    walk(coach, when(coach, at("place_key"), coach.light_in_place))
+    assert states[-1]["step"] == "stopped"
+    assert (states[-1]["instruction"], states[-1]["detail"]) == UNREACHABLE
