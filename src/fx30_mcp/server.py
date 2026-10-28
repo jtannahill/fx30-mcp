@@ -438,6 +438,8 @@ async def coach_shot(
     _holds_busy = True
     _coach = coach  # from here, stop_coach and start_recording can end it
     try:
+        if (await camera().settings())["recording"]:
+            raise ToolError("The camera is recording. Stop recording before setting up the shot.")
         await take_over_light()
         if _coach is not coach:
             raise ToolError("the shot coach was stopped before it began")

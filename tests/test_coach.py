@@ -580,3 +580,32 @@ def test_unreadable_eyes_add_no_step(monkeypatch):
     assert not any(s["instruction"] in ("Raise the key", "Lower the key a little") for s in states)
     assert states[-1]["step"] == "ready"
     assert len(calls) == 1
+
+
+def test_recording_seen_by_the_coach_stops_it():
+    camera, key = sim()
+    coach, states = coach_for(camera, key)
+    frames = []
+
+    async def go():
+        await coach.start()
+        real = camera.frame
+
+        async def counting():
+            frames.append(1)
+            return await real()
+
+        camera.frame = counting
+        camera.recording = True
+        coach.begin()
+        await asyncio.wait_for(coach.run(), 5)
+
+    asyncio.run(go())
+    last = states[-1]
+    assert last["step"] == "stopped"
+    assert (last["instruction"], last["detail"]) == (
+        "Camera is recording",
+        "The coach stopped so it does not read the camera during a take.",
+    )
+    assert frames == []
+    assert coach.running is False

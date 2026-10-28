@@ -44,6 +44,7 @@ LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO"}  # asked i
 ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from when the camera cannot say
 CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
 HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
+RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
 
 
 class LightError(Exception):
@@ -74,6 +75,10 @@ class _Light:
 
 class _Stopped(Exception):
     pass
+
+
+class _Recording(Exception):
+    """The camera started a take: live view must not be read during one."""
 
 
 def _number(setting: str, text: Any) -> float | None:
@@ -209,6 +214,8 @@ class Coach:
             self._show("ready", "Ready to record", None)
         except _Stopped:
             self._show("stopped", "Coach stopped", None)
+        except _Recording:
+            self._show("stopped", *RECORDING)
         except CameraError:
             self._show("stopped", "Camera stopped answering", WEDGED_HINT)
         except LightError as err:
@@ -270,6 +277,8 @@ class Coach:
 
     async def _readback(self) -> dict[str, str | None]:
         raw = await self.camera.settings()
+        if raw.get("recording"):
+            raise _Recording
         return {s: _canonical(s, raw.get(s)) for s in LABELS}
 
     async def _wait(

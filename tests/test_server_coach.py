@@ -277,3 +277,24 @@ def test_a_stop_during_take_over_does_not_start_a_survey(server, monkeypatch):
         assert server._coach is None and not server._busy.locked()
 
     asyncio.run(go())
+
+
+def test_coach_shot_refuses_while_the_camera_records(server):
+    async def go():
+        cam = server.camera()
+        await server.start_recording()
+        real = cam.frame
+        frames = []
+
+        async def counting():
+            frames.append(1)
+            return await real()
+
+        cam.frame = counting
+        with pytest.raises(ToolError, match=r"^The camera is recording\. Stop recording before setting up the shot\.$"):
+            await server.coach_shot(modifier="bare")
+        assert frames == []
+        assert server._coach is None and not server._busy.locked()
+        await server.stop_recording()
+
+    asyncio.run(go())
