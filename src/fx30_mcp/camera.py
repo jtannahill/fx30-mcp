@@ -11,6 +11,7 @@ Calls into libgphoto2 block, so each runs in a worker thread, one at a time.
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 import time
 from typing import Any
@@ -29,6 +30,35 @@ SETTING_NAMES = {
     "white_balance": ["whitebalance"],
     "kelvin": ["colortemperature"],
 }
+
+# Candidate names for what describe() reports. Unknown names read as None, so a
+# wrong guess is harmless. Only the names confirmed on the camera are known to
+# work; the rest are guesses until checked with `fx30-mcp props`.
+INFO_NAMES = {
+    "frame_rate": ["movieframerate", "recordingframerate", "moviefps"],
+    "file_format": ["movierecordsetting", "movieformat", "fileformat"],
+    "picture_profile": ["pictureprofile"],
+    "gamma": ["gamma"],
+    "display_assist": ["gammadisplayassist"],
+}
+
+
+def fps_from(text: str | None) -> float | None:
+    """The frame rate in text like "29.97p" or "4K 30p 100M"; None if there is none."""
+
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[pi]\b", text or "", re.IGNORECASE)
+    return float(match.group(1)) if match else None
+
+
+def _flag(value: Any) -> bool | None:
+    """On/Off style values as a bool; None if the value is not one of those."""
+
+    text = str(value).strip().lower()
+    if text in ("on", "1", "true"):
+        return True
+    if text in ("off", "0", "false"):
+        return False
+    return None
 
 
 WEDGED_HINT = (
@@ -49,6 +79,7 @@ class CameraBase:
     backend: str
 
     async def settings(self) -> dict[str, Any]: ...
+    async def describe(self) -> dict[str, Any]: ...
     async def set(self, setting: str, value: str) -> str: ...
     async def set_kelvin(self, kelvin: int) -> None: ...
     async def frame(self) -> bytes: ...
@@ -162,6 +193,35 @@ class GPhotoCamera(CameraBase):
                 out[setting] = None
         return out
 
+    def _choices(self, setting: str) -> list[str]:
+        try:
+            _name, widget = self._widget(setting)
+            return [widget.get_choice(i) for i in range(widget.count_choices())]
+        except Exception:
+            return []
+
+    def _info(self) -> dict[str, Any]:
+        import gphoto2 as gp
+
+        raw: dict[str, Any] = {}
+        for key, names in INFO_NAMES.items():
+            raw[key] = None
+            for name in names:
+                try:
+                    raw[key] = self._camera.get_single_config(name).get_value()
+                    break
+                except gp.GPhoto2Error:
+                    continue
+        return {
+            "frame_rate": fps_from(raw["frame_rate"]) or fps_from(raw["file_format"]),
+            "file_format": raw["file_format"],
+            "picture_profile": raw["picture_profile"],
+            "gamma": raw["gamma"],
+            "display_assist": _flag(raw["display_assist"]),
+            "apertures": self._choices("aperture"),
+            "shutters": self._choices("shutter"),
+        }
+
     def _write(self, setting: str, value: str) -> str:
         import gphoto2 as gp
 
@@ -256,6 +316,9 @@ class GPhotoCamera(CameraBase):
         state = await self._run(self._recording)
         out["recording"] = self.recording if state is None else state
         return out
+
+    async def describe(self) -> dict[str, Any]:
+        return await self._run(self._info)
 
     async def set(self, setting: str, value: str) -> str:
         return await self._run(self._write, setting, value)

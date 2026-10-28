@@ -67,6 +67,11 @@ class SimLight:
         pass
 
 
+APERTURES = ["f/2.8", "f/3.2", "f/3.5", "f/4", "f/4.5", "f/5", "f/5.6", "f/6.3", "f/7.1", "f/8", "f/9",
+             "f/10", "f/11", "f/13", "f/14", "f/16", "f/18", "f/20", "f/22"]
+SHUTTERS = ["1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500"]
+
+
 class SimCamera(CameraBase):
     backend = "sim"
 
@@ -149,6 +154,17 @@ class SimCamera(CameraBase):
 
     async def settings(self) -> dict[str, Any]:
         return {**self.values, "kelvin": self.kelvin, "recording": self.recording}
+
+    async def describe(self) -> dict[str, Any]:
+        return {
+            "frame_rate": 29.97,
+            "file_format": "XAVC S 4K",
+            "picture_profile": "PP8",
+            "gamma": "S-Log3",
+            "display_assist": False,
+            "apertures": list(APERTURES),
+            "shutters": list(SHUTTERS),
+        }
 
     async def set(self, setting: str, value: str) -> str:
         self.values[setting] = value
