@@ -31,13 +31,21 @@ or the light's distance (half the distance is two stops more).
 
 | Tool | What it does |
 |---|---|
+| `coach_shot` | Plans the camera and lights for this room, then coaches you through it from a page on your phone (QR code and link); saves what is on the key light |
+| `stop_coach` | Ends the coach and its page; camera and lights stay as they are |
 | `look` | Shows a live-view frame and meters the face against the target |
 | `balance_shot` | Matches white balance, then lights the face to the target |
 | `set_face_target` | Saves the face brightness and skin colour to aim for: light it how you like, then call it with no level |
 | `match_white` | Light and camera to one colour temperature |
 | `set_lights` | The key light (on the face), the fill (on the shadow side) and the lighting ratio; with nothing given, lists the lights amaran Desktop has paired |
 | `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, recording state |
-| `start_recording` / `stop_recording` | Record to the card |
+| `start_recording` / `stop_recording` | Record to the card; starting stops the coach first |
+
+## Shot coach
+
+Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. You set ISO, shutter and aperture on the camera (they are read-only over USB) and the coach confirms them by readback, then walks you through placing the key, the fill and the balance until it says Ready to record.
+
+Without an ND filter the plan stops the lens down to f/11, then f/16, then raises the shutter through 1/125, 1/250 and 1/500, and tells you when a bright window still cannot be held. `balance_shot` refuses while the coach runs; `stop_coach` (or `start_recording`) ends it.
 
 ## Setup
 
