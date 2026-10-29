@@ -24,6 +24,7 @@ from .coach import UNREACHABLE, Coach, LightError, LightUnreachable
 from .web import Broadcaster, WebHandle, start_web
 
 log = logging.getLogger(__name__)
+BLUETOOTH_HOLD_SECONDS = 600.0
 
 BACKEND = os.environ.get("FX30_BACKEND", "gphoto2").lower()
 
@@ -103,7 +104,14 @@ def named_light(name: str) -> Any:
                              + ", ".join(repr(f["name"]) for f in fixtures))
         # Send as amaran-mcp's own mesh address, so the lights' message counters stay in step.
         light = Light(source_address=load_light().source_address, **fixture)
-        _named_lights[(name, backend)] = DesktopLight(light) if backend == "desktop" else AmaranLight(light)
+        if backend == "desktop":
+            _named_lights[(name, backend)] = DesktopLight(light)
+        else:
+            bluetooth = AmaranLight(light)
+            # Finding the light can take a minute or two (it advertises rarely), so hold
+            # the link through the quiet stretches of a setup, not amaran-mcp's 30 s.
+            bluetooth.link.idle_timeout = BLUETOOTH_HOLD_SECONDS
+            _named_lights[(name, backend)] = bluetooth
     return _named_lights[(name, backend)]
 
 
