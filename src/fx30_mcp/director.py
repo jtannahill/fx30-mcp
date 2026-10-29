@@ -6,6 +6,7 @@ check itself, the experiments decide cannot make. When the camera starts recordi
 take mode and holds what recording started with; when it stops, the take's report goes to the page and
 by text, and setup watches for the next take. The run ends on stop(), after IDLE_END_SECONDS without
 recording, or on a camera error. Every change of what the page should show goes out through publish.
+With camera_moves off (balance_shot) setup runs decide's balance mode: the light alone, no key check.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import asyncio
 import dataclasses
 import math
 import time
-from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from . import config, meter
@@ -23,7 +23,6 @@ from .config import Settings
 from .decide import (
     CONNECTING,
     NO_FACE,
-    UNREACHABLE,
     Ask,
     Goal,
     History,
@@ -32,13 +31,17 @@ from .decide import (
     _number,
     canonical,
     decide,
+    key_placed,
     start_take,
 )
 from .notify import Texts
-from .plan import UNEVEN_STOPS, Plan, _widest_offered, exposure_of, face_light, make_plan, window_light
+from .plan import Plan, _widest_offered, exposure_of, face_light, key_geometry, make_plan, window_light
 from .rig import LightError, LightUnreachable, Rig
+from .report import Take, capital, report_text
 from .scene import Scene, read_scene
-from .survey import KeyCheck, key_check, survey
+from .survey import key_check, survey
+
+__all__ = ["Director", "IDLE_END_SECONDS", "TAKE_INTERVAL", "report_text"]
 
 TAKE_INTERVAL = 1.0
 IDLE_END_SECONDS = 1800.0
@@ -49,90 +52,15 @@ CARD = ("iso", "shutter", "aperture")
 ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from when the camera cannot say
 LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO", "kelvin": "White balance"}
 SETTING_LIGHT = ("Hold still", "Setting the light.")
-WINDOW_CLIPPING = "window clipping; "
-QUIET_HELD = {"no snapshot", "camera changed by hand"}  # said elsewhere in the report, or not worth saying
+RETRYING = (
+    "The light isn't answering",
+    "Retrying on its own. If the amaran or Sidus Link app is open on your phone, close it.",
+)
+RECORDING_NOTE = "The camera is recording; balance_shot leaves the light alone during a take."
 
 
 class _Stopped(Exception):
     pass
-
-
-@dataclass
-class _Take:
-    number: int
-    started: float
-    meter: float | None
-    last: float  # the time of the last tick, so each tick counts the seconds since the one before
-    meter_now: float | None = None
-    face_off: float = 0.0
-    window_red: float = 0.0
-    window_red_now: bool = False
-    camera_steps: int = 0
-    held: dict[str, float] = field(default_factory=dict)
-    light_errors: int = 0
-
-
-def _duration(seconds: float) -> str:
-    minutes, secs = divmod(round(seconds), 60)
-    if minutes and secs:
-        return f"{minutes} min {secs} s"
-    return f"{minutes} min" if minutes else f"{secs} s"
-
-
-def _times(n: int) -> str:
-    return "once" if n == 1 else f"{n} times"
-
-
-def _past(reason: str) -> str:
-    return reason.replace(" is ", " was ")
-
-
-def _capital(text: str) -> str:
-    return text[:1].upper() + text[1:]
-
-
-def report_text(report: dict[str, Any]) -> str:
-    """The take's report as one short text, for the page and for Natasha."""
-
-    held = report.get("held") or {}
-    parts = [f"Take {report['take']}: {_duration(report['seconds'])}."]
-    if round(report["face_off_seconds"]) < 1:
-        parts.append("Face held throughout.")
-    else:
-        parts.append(f"Face off its level for {_duration(report['face_off_seconds'])}.")
-    if round(report["window_red_seconds"]) >= 1:
-        text = f"Window clipped for {_duration(report['window_red_seconds'])}"
-        if report["window_red_at_end"]:
-            text += " at the end"
-        why = max((r for r in held if r.startswith(WINDOW_CLIPPING)), key=held.get, default=None)
-        if why is not None:
-            text += "; " + _past(why[len(WINDOW_CLIPPING) :])
-        parts.append(text + ".")
-    change = report.get("meter_change")
-    if change is not None and abs(change) >= 1 / 3:
-        stops = round(abs(change), 1)
-        parts.append(f"The scene got {stops:g} stop{'' if stops == 1 else 's'} {'brighter' if change > 0 else 'darker'}.")
-    if report["camera_steps"]:
-        parts.append(f"The camera stepped {_times(report['camera_steps'])} for the window.")
-    if report["hands_off"]:
-        parts.append("The camera was changed by hand, so the director left it alone for the rest of the take.")
-    if report["light_errors"]:
-        parts.append(f"The light stopped answering {_times(report['light_errors'])}.")
-    for reason, seconds in held.items():
-        if reason.startswith(WINDOW_CLIPPING) or reason in QUIET_HELD:
-            continue
-        what = "Out of the frame" if reason == "no face" else _capital(_past(reason))
-        parts.append(f"{what} for {_duration(seconds)}.")
-    return " ".join(parts)
-
-
-def _key_good(check: KeyCheck | None, side: str) -> bool:
-    """The key reaches the face from the planned side (decide's key ask says the same)."""
-
-    if check is None or check.lit is None:
-        return False
-    near, far = check.sides if side == "left" else reversed(check.sides)
-    return far <= near * 2**UNEVEN_STOPS
 
 
 class Director:
@@ -175,13 +103,12 @@ class Director:
         self._quiet = 0  # setup ticks in a row that wanted nothing
         self._card_right = False
         self._mark: tuple[float, float] | None = None  # face level and cheek balance when a key ask began
-        self._take: _Take | None = None
+        self._take: Take | None = None
         self._takes = 0
         self._showing_report = False
         self._warned: set[str] = set()
         self._light_problem: tuple[str, str | None] | None = None
         self._last_ask: Ask | None = None
-        self._camera_wanted = False
         self._idle_since = 0.0
         self._before_connecting: dict | None = None
 
@@ -252,44 +179,67 @@ class Director:
             self.mode = "stopped"
             self._hold(False)
 
-    async def settle(self, max_ticks: int) -> dict[str, Any]:
-        """Setup until Ready or max_ticks, for balance_shot: whether it got there, the key, and any ask."""
+    async def settle(self, max_ticks: int, kelvin: int | None = None) -> dict[str, Any]:
+        """Setup until Ready or max_ticks, for balance_shot: whether it got there, the key, and any ask.
 
+        With camera_moves off there is no survey (it switches the key off): the goal comes from the
+        settings, at kelvin, or the key's own colour temperature. Nothing is written while recording."""
+
+        notes: list[str] = []
+        done = False
         self._hold(True)
         try:
-            done = False
-            if self.plan is not None or await self.start() is not None:
-                for _ in range(max_ticks):
-                    if self._stopping:
-                        break
-                    scene, rig, now = await self._read()
-                    await self._setup_tick(scene, rig, now)
-                    if self.state.get("step") == "ready":
-                        done = True
-                        break
-                    await self.sleep(self._settle)
-            else:
+            if (await self.rig.camera.settings()).get("recording"):
+                notes.append(RECORDING_NOTE)
+            elif self.goal is None and not self.camera_moves:
+                self.goal = self._light_goal(kelvin)
+            elif self.goal is None and await self.start() is None:
                 self._last_ask = Ask(*NO_FACE)
+            while self.goal is not None and not notes and max_ticks > 0 and not self._stopping:
+                max_ticks -= 1
+                scene, rig, now = await self._read()
+                if scene.camera.get("recording"):
+                    notes.append(RECORDING_NOTE)
+                    break
+                await self._setup_tick(scene, rig, now)
+                if self.state.get("step") == "ready":
+                    done = True
+                    break
+                await self.sleep(self._settle)
         finally:
             self._hold(False)
-        light = self.rig.key.state
-        notes = []
-        if self._camera_wanted and not self.camera_moves:
-            notes.append("The camera is not on the plan, and balancing leaves it alone; the light waits for it.")
         if self._light_problem is not None:
             notes.append(" ".join(p for p in self._light_problem if p))
-        ask = self._last_ask
+        light, ask = self.rig.key.state, self._last_ask
+        words = [] if ask is None else [p if p.endswith(".") else p + "." for p in (ask.instruction, ask.detail) if p]
         return {
             "done": done,
             "light": {"brightness": light.brightness, "kelvin": light.kelvin, "tint": light.tint},
-            "advice": None if ask is None else " ".join(p if p.endswith(".") else p + "." for p in (ask.instruction, ask.detail) if p),
+            "advice": " ".join(words) or None,
             "notes": notes,
         }
+
+    def _light_goal(self, kelvin: int | None) -> Goal:
+        """The goal for balancing the light alone, from the settings: no plan, no survey."""
+
+        settings = self.settings
+        side = self.override or "left"
+        return Goal(
+            face_level=settings.target,
+            skin_hue=settings.skin_hue,
+            window_range=settings.window_range,
+            profile=self.profile,
+            tint_sign=settings.tint_sign,
+            kelvin=kelvin or self.rig.key.state.kelvin or 5600,
+            frame_rate=settings.frame_rate or 29.97,
+            widest=settings.widest_aperture or 2.8,
+            geometry=key_geometry(side, settings.key_modifier, settings.key_size_in),
+        )
 
     def status(self) -> dict[str, Any]:
         take = None
         if self._take is not None:
-            so_far = self._report(self._take, self.clock())
+            so_far = self._take.report(self.clock(), self.history.hands_off)
             take = {"seconds": so_far["seconds"], "report": so_far}
         return {
             "mode": self.mode,
@@ -347,21 +297,19 @@ class Director:
             await self._setup_tick(scene, rig, now)
 
     async def _setup_tick(self, scene: Scene, rig: RigState, now: float) -> None:
-        goal, history = self.goal, self.history
+        goal, history, light_only = self.goal, self.history, not self.camera_moves
         self._judge(scene.face, scene.level, scene.window, goal.face_level)
-        moves = decide(scene, rig, goal, "setup", history, now)
+        moves = decide(scene, rig, goal, "balance" if light_only else "setup", history, now)
         history.last_tick = now
         self._last_ask = moves.ask
-        self._camera_wanted = moves.camera is not None
         if scene.face and moves.camera is None:
             self._card_right = True
         try:
-            if await self._experiment(scene, rig, moves):
+            if not light_only and await self._experiment(scene, rig, moves):
                 self._quiet = 0
                 return
-            applied = moves if self.camera_moves else dataclasses.replace(moves, camera=None)
-            await self.rig.apply(applied, history)
-            if applied.light is not None:
+            await self.rig.apply(moves, history)
+            if moves.light is not None:
                 self._light_ok()
         except LightError as err:
             await self._light_failed(err)
@@ -373,7 +321,7 @@ class Director:
         ready = self._quiet >= 2 and self._lights["face"] == "green" and self._lights["window"] != "red"
         if moves.camera is not None or not self._card_right:
             step = "camera"
-        elif not self._key_ok():
+        elif not light_only and not self._key_ok():
             step = "place_key"
         else:
             step = "ready" if ready else "balance"
@@ -385,7 +333,7 @@ class Director:
             instruction, detail = "Ready to record", None
         else:
             instruction, detail = SETTING_LIGHT
-        if ready and not was_ready:
+        if ready and not was_ready and self.plan is not None:
             self._save_key_output(scene, rig)
         self._show(step, instruction, detail, screen=self._screen(moves))
 
@@ -401,7 +349,7 @@ class Director:
             await self.rig.key.set_power(True)
             await self._check_key(scene)
             return True
-        if not _key_good(history.key_check, self.goal.geometry.side):
+        if not key_placed(history.key_check, self.goal.geometry.side):
             balance = meter.stops_off(scene.sides[1], scene.sides[0], self.profile)
             if self._mark is None:
                 self._mark = (scene.level, balance)
@@ -413,10 +361,15 @@ class Director:
                 return True
             return False
         if history.catchlight in ("raise", "lower"):
-            # Asked to move the key for the eyes: watch the catchlight until it sits right.
+            # Asked to move the key for the eyes: the ask shows for a tick, then the catchlight is
+            # watched until it sits right.
+            if self._mark is None:
+                self._mark = (scene.level, 0.0)
+                return False
             verdict = await asyncio.to_thread(meter.catchlight, scene.frame, history.key_check.off, self.profile)
-            if verdict in ("ok", None):
-                history.catchlight = verdict
+            if verdict != history.catchlight:
+                history.catchlight = verdict  # ok, unreadable, or now the other way
+                self._mark = None
                 return True
         return False
 
@@ -425,21 +378,21 @@ class Director:
         self._show("place_key", f"Key on camera-{self.goal.geometry.side}", "Checking which side it lights.")
         check = await key_check(self.rig.camera, self.rig.key, scene.box, self.profile, self._settle, self.sleep)
         self.history.key_check = check
-        if _key_good(check, self.goal.geometry.side):
+        if key_placed(check, self.goal.geometry.side):
             self.history.catchlight = await asyncio.to_thread(meter.catchlight, check.on, check.off, self.profile)
         self._light_ok()
 
     def _key_ok(self) -> bool:
-        placed = _key_good(self.history.key_check, self.goal.geometry.side)
+        check = self.history.key_check
+        placed = check is not None and key_placed(check, self.goal.geometry.side)
         return placed and self.history.catchlight not in ("raise", "lower")
 
     def _begin_take(self, scene: Scene, now: float) -> None:
-        if scene.face:
-            start_take(scene, self.history)
-        else:
+        start_take(scene, self.history)  # a new take: the last one's hands and camera values go
+        if not scene.face:
             self.history.snapshot = None  # taken when the face is back: a take holds a face, not a wall
         self._takes += 1
-        self._take = _Take(self._takes, now, scene.camera.get("meter"), now)
+        self._take = Take(self._takes, now, scene.camera.get("meter"), now)
         self.mode = "take"
         self._mark = None
         self._quiet = 0
@@ -454,15 +407,8 @@ class Director:
         self._judge(scene.face, scene.level, scene.window, level)
         moves = decide(scene, rig, self.goal, "take", history, now)
         history.last_tick = now
-        dt, take.last = now - take.last, now
-        take.meter_now = scene.camera.get("meter")
-        if self._lights["face"] != "green":
-            take.face_off += dt
-        take.window_red_now = self._lights["window"] == "red"
-        if take.window_red_now:
-            take.window_red += dt
-        if moves.held is not None:
-            take.held[moves.held] = take.held.get(moves.held, 0.0) + dt
+        lights = self._lights
+        take.tick(now, scene.camera.get("meter"), lights["face"] == "green", lights["window"] == "red", moves.held)
         applied = moves if self.camera_moves else dataclasses.replace(moves, camera=None)
         if applied.camera is not None:
             take.camera_steps += 1
@@ -475,7 +421,7 @@ class Director:
             await self._light_failed(err)
         detail = self._light_problem[0] if self._light_problem else None
         if moves.held is not None:
-            detail = _capital(moves.held)
+            detail = capital(moves.held)
         self._show("take", "Recording", detail, screen="take")
 
     async def _end_take(self, scene: Scene, now: float) -> None:
@@ -490,24 +436,9 @@ class Director:
         await self.texts.send("report", self.last_report["text"])
 
     def _finish_take(self) -> dict[str, Any]:
-        report = self._report(self._take, self._take.last)
+        report = self._take.report(self._take.last, self.history.hands_off)
         self._take = None
         return {**report, "text": report_text(report)}
-
-    def _report(self, take: _Take, now: float) -> dict[str, Any]:
-        start, end = take.meter, take.meter_now
-        return {
-            "take": take.number,
-            "seconds": round(now - take.started, 1),
-            "meter_change": None if start is None or end is None else round(end - start, 2),
-            "face_off_seconds": round(take.face_off, 1),
-            "window_red_seconds": round(take.window_red, 1),
-            "window_red_at_end": take.window_red_now,
-            "camera_steps": take.camera_steps,
-            "held": {reason: round(seconds, 1) for reason, seconds in take.held.items()},
-            "light_errors": take.light_errors,
-            "hands_off": self.history.hands_off,
-        }
 
     # What the page shows, and what Natasha says.
 
@@ -570,7 +501,7 @@ class Director:
 
     async def _light_failed(self, err: LightError) -> None:
         if isinstance(err, LightUnreachable):
-            self._light_problem = UNREACHABLE
+            self._light_problem = RETRYING
             body = "The light isn't answering. If the amaran or Sidus Link app is open on your phone, close it."
         else:
             self._light_problem = ("A light stopped answering", str(err))

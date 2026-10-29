@@ -3,7 +3,8 @@
 decide() looks at one Scene, the rig as last written, the goal and the history, and returns
 Moves: at most one light move, one camera move and one thing to ask of the person. It is pure
 apart from updating history.gain and history.last_stops in setup, and history.hands_off and
-history.last_tint_step in a take. Setup mode brings the shot to Ready. Take mode holds what recording
+history.last_tint_step in a take. Setup mode brings the shot to Ready. Balance mode is setup for the
+light alone: no camera move and no key placement, for balance_shot. Take mode holds what recording
 started with (start_take), slowly enough that a viewer never sees a change, and never asks.
 The Rig applies the moves and the Director owns the history.
 """
@@ -171,8 +172,8 @@ def canonical(setting: str, value: Any) -> str | None:
 
 
 def decide(scene: Scene, rig: RigState, goal: Goal, mode: str, history: History, now: float) -> Moves:
-    if mode == "setup":
-        return _setup(scene, rig, goal, history)
+    if mode in ("setup", "balance"):
+        return _setup(scene, rig, goal, history, light_only=mode == "balance")
     if mode == "take":
         return _take(scene, rig, goal, history, now)
     raise ValueError(f"unknown mode {mode!r}")
@@ -218,6 +219,16 @@ def _card_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
     return None
 
 
+def key_placed(check: KeyCheck, side: str) -> bool:
+    """The key reaches the face and lights it from the planned side."""
+
+    if check.lit is None:
+        return False
+    near, far = check.sides if side == "left" else reversed(check.sides)
+    # A soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong.
+    return far <= near * 2**UNEVEN_STOPS
+
+
 def _key_ask(goal: Goal, history: History) -> Ask | None:
     geometry = goal.geometry
     check = history.key_check
@@ -227,11 +238,9 @@ def _key_ask(goal: Goal, history: History) -> Ask | None:
             f"{fmt_ft(geometry.distance_ft)} from your face, {fmt_ft(geometry.height_ft)} above your eyes, "
             "aimed down.",
         )
-    near, far = check.sides if geometry.side == "left" else reversed(check.sides)
     if check.lit is None:
         return Ask("Turn the key on", "The key isn't reaching your face.")
-    # A soft key lights both cheeks nearly alike; only a clearly brighter far side is wrong.
-    if far > near * 2**UNEVEN_STOPS:
+    if not key_placed(check, geometry.side):
         return Ask("Key is on the wrong side", f"Move it to camera-{geometry.side}.")
     if history.catchlight == "raise":
         return Ask("Raise the key", "The catchlight is low in your eyes.")
@@ -259,16 +268,18 @@ def _learn_gain(stops: float, history: History) -> None:
     history.last_stops = stops
 
 
-def _setup(scene: Scene, rig: RigState, goal: Goal, history: History) -> Moves:
-    move = _camera_move(scene, rig, goal)
+def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only: bool = False) -> Moves:
+    """Light only (balance mode) leaves the camera and the key's placement as they are."""
+
+    move = None if light_only else _camera_move(scene, rig, goal)
     if move is not None:
         return Moves(camera=move)
     if not scene.face:
         return Moves(ask=Ask(*NO_FACE))
-    move = _card_move(scene, rig, goal)
+    move = None if light_only else _card_move(scene, rig, goal)
     if move is not None:
         return Moves(camera=move)
-    ask = _key_ask(goal, history)
+    ask = None if light_only else _key_ask(goal, history)
     if ask is not None:
         return Moves(ask=ask)
 

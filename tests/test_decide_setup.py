@@ -14,6 +14,7 @@ from fx30_mcp.decide import (
     Moves,
     RigState,
     decide,
+    key_placed,
 )
 from fx30_mcp.plan import Geometry, closer, fmt_ft
 from fx30_mcp.scene import Scene
@@ -208,3 +209,47 @@ def test_a_halved_gain_mid_range_never_asks_to_move_the_key(brightness, gain, st
     moves = go(scene=make_scene(level=level_for(stops)), rig=make_rig(brightness=brightness), history=history)
     assert moves.ask is None
     assert (moves.light.brightness - brightness) * stops > 0
+
+
+# Balance mode: the light alone, for balance_shot.
+
+OFF_PLAN = {**CAMERA, "exposure_mode": "Movie F Mode", "live_view_effect": False, "kelvin": "5000", "aperture": "f/11"}
+CLIPPING = meter.Window(level=1.0, clipped=0.5, box=(0.0, 0.0, 0.2, 0.2), side="left", blue=0.0)
+
+
+def balance(scene=None, rig=None, history=None):
+    return decide(scene or make_scene(), rig or make_rig(), make_goal(), "balance", history or History(), 0.0)
+
+
+@pytest.mark.parametrize("stops", [-1.0, -0.4, 0.0, 0.4, 1.0])
+def test_balance_mode_never_moves_the_camera_or_asks_for_the_key(stops):
+    scene = make_scene(level=level_for(stops), window=CLIPPING, camera=OFF_PLAN)
+    moves = balance(scene, make_rig(camera=OFF_PLAN))
+    assert moves.camera is None
+    assert moves.ask is None  # no key check has run, and balance mode never asks for one
+
+
+def test_balance_mode_moves_the_key_toward_the_target():
+    up = balance(make_scene(level=level_for(1.0), camera=OFF_PLAN), make_rig(brightness=30.0, camera=OFF_PLAN))
+    down = balance(make_scene(level=level_for(-1.0), camera=OFF_PLAN), make_rig(brightness=30.0, camera=OFF_PLAN))
+    assert up.light.brightness > 30.0 > down.light.brightness
+    assert up.light.kelvin == 5600
+
+
+def test_balance_mode_still_asks_for_a_closer_key_and_for_a_face():
+    moves = balance(make_scene(level=level_for(1.0), camera=OFF_PLAN), make_rig(brightness=100.0, camera=OFF_PLAN))
+    assert moves.ask.instruction == "Key closer" and moves.camera is None
+    assert balance(make_scene(face=False, camera=OFF_PLAN), make_rig(camera=OFF_PLAN)).ask == Ask(*NO_FACE)
+
+
+def test_balance_mode_steps_the_tint():
+    moves = balance(make_scene(hue=140.0, camera=OFF_PLAN), make_rig(camera=OFF_PLAN))
+    assert moves.light is not None and moves.light.tint != 0 and moves.camera is None
+
+
+def test_key_placed():
+    assert key_placed(KeyCheck(sides=(0.5, 0.3), lit="left"), "left")
+    assert key_placed(KeyCheck(sides=(0.5, 0.5), lit="right"), "left")  # a soft key lights both cheeks alike
+    assert not key_placed(KeyCheck(sides=(0.3, 0.5), lit="right"), "left")
+    assert key_placed(KeyCheck(sides=(0.3, 0.5), lit="right"), "right")
+    assert not key_placed(KeyCheck(sides=(0.0, 0.0), lit=None), "left")

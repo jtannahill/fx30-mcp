@@ -6,7 +6,8 @@ from amaran_mcp.link import LinkError
 from fx30_mcp import config, meter
 from fx30_mcp.camera import CameraError
 from fx30_mcp.config import Settings
-from fx30_mcp.director import IDLE_END_SECONDS, Director, report_text
+from fx30_mcp.director import IDLE_END_SECONDS, Director
+from fx30_mcp.report import report_text
 from fx30_mcp.notify import RecordedTexts
 from fx30_mcp.rig import Rig
 from fx30_mcp.sim import SimCamera, SimLight
@@ -452,19 +453,101 @@ def test_status_reports_the_take_so_far():
 
 
 def test_settle_balances_the_light_and_leaves_the_camera_alone():
-    camera, key = sim(exposure_mode="M")  # already on the card: only the light needs work
+    camera, key = sim(aperture="f/11")  # Movie F Mode, off the card: balance_shot leaves all of it
     director, states, texts, clock = make(camera, key, camera_moves=False)
     result = asyncio.run(director.settle(40))
     assert result["done"] is True
-    assert camera.sets == [] and camera.exposure_mode == "M"
+    assert camera.sets == [] and camera.exposure_mode == "Movie F Mode" and camera.kelvin is None
+    assert camera.values == {"iso": "800", "shutter": "1/60", "aperture": "f/11"}
+    assert not [on for _t, on in key.powers if not on]  # no survey, no key check: the key never goes off
+    level = meter.read(camera.render(), SIM_FACE).lit
+    assert abs(meter.stops_off(level, Settings().target, "rec709")) <= 1 / 6
     assert result["light"]["brightness"] == key.state.brightness != 30
-    assert result["advice"] is None
+    assert result["advice"] is None and result["notes"] == []
 
 
-def test_settle_without_camera_moves_says_the_camera_is_off_the_plan():
-    camera, key = sim()  # Movie F Mode: decide wants Manual before it touches the light
+def test_settle_gives_the_key_ask_as_advice():
+    camera, key = sim(stops_at_full=-1.0, aperture="f/11")  # at full the face is still a stop under
     director, states, texts, clock = make(camera, key, camera_moves=False)
-    result = asyncio.run(director.settle(5))
+    result = asyncio.run(director.settle(30))
     assert result["done"] is False
-    assert camera.sets == [] and camera.exposure_mode == "Movie F Mode"
-    assert result["notes"]
+    assert result["advice"].startswith("Key closer.")
+    assert camera.sets == []
+
+
+def test_settle_leaves_the_light_alone_while_recording():
+    camera, key = sim(aperture="f/11")
+    camera.recording = True
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(10))
+    assert result["done"] is False
+    assert result["notes"] == ["The camera is recording; balance_shot leaves the light alone during a take."]
+    assert key.timed == [] and key.powers == [] and camera.sets == []
+
+
+def test_settle_stops_when_recording_starts():
+    camera, key = sim(aperture="f/11")
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    mark = {}
+
+    def script(t: float) -> None:
+        if t >= 1.0 and not camera.recording:
+            camera.recording = True
+            mark["t"] = t
+
+    clock.script = script
+    result = asyncio.run(director.settle(40))
+    assert result["done"] is False and "recording" in result["notes"][0]
+    assert not [w for t, w in key.timed if t >= mark["t"]]
+
+
+def test_a_take_started_without_a_face_forgets_the_last_takes_hands(face):
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+    seen = {}
+
+    def then(s: float) -> None:
+        camera.recording = 1 <= s < 15 or s >= 20
+        if s >= 6 and "hand" not in seen:
+            seen["hand"] = True
+            camera.values["aperture"] = "f/8"
+        face["on"] = not (19 <= s < 23)  # out of the shot as the second take starts
+        if s >= 21.5 and "status" not in seen:
+            seen["status"] = director.status()  # the second take, its face not yet back
+        if s > 26:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    assert director.status()["last_report"]["take"] == 2
+    assert seen["status"]["take"]["report"]["hands_off"] is False
+    assert texts.sent[0][0] == "report" and "by hand" in texts.sent[0][1]
+
+
+def test_a_catchlight_that_flips_from_raise_to_lower_is_followed(monkeypatch):
+    verdicts = iter(["raise", "lower", "lower", "ok"])
+    monkeypatch.setattr(meter, "catchlight", lambda _on, _off, _profile="rec709": next(verdicts, "ok"))
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    shown = [s["instruction"] for s in states]
+    assert shown.index("Raise the key") < shown.index("Lower the key a little") < shown.index("Ready to record")
+
+
+def test_an_unreachable_light_in_setup_says_it_is_retrying():
+    camera, key = sim()
+    failures = {"left": 2}
+    original = key.set_white
+
+    async def flaky(kelvin, brightness=None, tint=0):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise LinkError("could not connect to the light")
+        await original(kelvin, brightness, tint)
+
+    key.set_white = flaky
+    director, states, texts, clock = make(camera, key)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    details = [s["detail"] or "" for s in states]
+    assert "Retrying on its own. If the amaran or Sidus Link app is open on your phone, close it." in details
+    assert not any("start the coach again" in d for d in details)
+    assert [kind for kind, _ in texts.sent] == ["light"]
