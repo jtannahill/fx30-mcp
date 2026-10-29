@@ -1,4 +1,4 @@
-"""Texts from Natasha to the owner: the coach link, the report after a take, warnings.
+"""Texts to the owner over Twilio: the coach link, the report after a take, warnings.
 
 A send never raises: texts must not stop the director. A failure is logged with
 the kind and the error class only, never the token or a phone number.
@@ -59,10 +59,14 @@ def _urllib_post(url: str, data: dict, auth: tuple[str, str]) -> dict:
         return {}
 
 
-class NatashaTexts:
+# The owner's setup keeps its Twilio credentials here; FX30_TWILIO_ENV points elsewhere.
+DEFAULT_ENV = Path.home() / "twilio-phone-tree" / ".env"
+
+
+class TwilioTexts:
     def __init__(
         self,
-        env_path: Path = Path.home() / "twilio-phone-tree" / ".env",
+        env_path: Path = DEFAULT_ENV,
         post: Callable[[str, dict, tuple[str, str]], dict] | None = None,
     ) -> None:
         self._env_path = env_path
@@ -134,6 +138,10 @@ class Limited:
 
 
 def texts_for_server() -> Texts:
-    if os.environ.get("FX30_BACKEND") == "sim" or os.environ.get("FX30_TEXTS") == "off":
+    """Twilio texts when a credentials file exists (FX30_TWILIO_ENV, else DEFAULT_ENV);
+    otherwise texts are kept in memory only, as they are for the pretend camera."""
+
+    env = Path(os.environ.get("FX30_TWILIO_ENV") or DEFAULT_ENV).expanduser()
+    if os.environ.get("FX30_BACKEND") == "sim" or os.environ.get("FX30_TEXTS") == "off" or not env.exists():
         return Limited(RecordedTexts())
-    return Limited(NatashaTexts())
+    return Limited(TwilioTexts(env))

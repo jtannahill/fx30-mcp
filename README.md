@@ -1,33 +1,90 @@
 # fx30-mcp
 
-Control a Sony FX30 from Claude Code and light a one-person talking head with an
-amaran light. The camera records to its own card; this drives it over USB and
-uses its live view to meter the face.
+Set up and watch a one-person talking-head shot with a Sony FX30 and an amaran
+light, from Claude Code. It drives the camera over USB, reads its live view, and
+sets the camera and the light for you, then keeps your face lit through every
+take.
 
-## The idea
+## The use case
 
-For an interview, set the camera once and let the light do the work:
+You film yourself at a desk with a window behind you. The last time, your face
+came out dark and the window blew out. You did not know which side of the camera
+the light belonged on, how far away, or what to set on the camera. That is the
+hard part of any shot when you are alone: you are in front of the lens, not
+behind it.
 
-- Shutter at twice the frame rate (1/50 for 24p or 25p).
-- ISO at a native base (800 or 2500 in S-Log3).
-- Aperture for the depth of field you want. The FX30 has no built-in ND.
+With fx30-mcp you ask Claude to set up the shot, and:
 
-`balance_shot` then works the key light alone (it never touches the camera):
+1. **It looks at the room** with the light off: where the window is, how bright,
+   which way you are turned, and which side of your face the window already lights.
+2. **It makes a plan**: which side of the camera the key goes on, how far, how
+   high and aimed how far down, and the camera settings that keep the window in
+   range. A page on your phone shows it as a top-down diagram and a side view.
+3. **It sets the camera itself** (Manual, aperture, shutter, ISO, white balance)
+   and the light (brightness, colour temperature, tint). The only thing it asks of
+   you is moving the light, and only when no setting can fix what it sees. It sees
+   in the frame when you have moved it. There is nothing to tap.
+4. **It watches every take.** While you record, the light follows your face as
+   daylight changes, slowly enough that a viewer never sees it, and the camera
+   steps a third of a stop at a time when the window brightens or darkens, with
+   the light moving the other way in the same moment so your face does not change.
+   If the face and the window cannot both be held, the face wins.
+5. **It reports after each take** on the page and, if you set it up, by text:
+   "Take 2: 4 min 10 s. Face held throughout. Window clipped for 20 s at the end;
+   the light was at full."
 
-1. Reads a live-view frame, finds the face with Apple Vision and meters the
-   middle of it (cheeks, nose, forehead).
-2. Works out how many stops the face is off the target and moves the key's
-   brightness by that much, until it is within a sixth of a stop.
-3. Reads the skin's hue the way a vectorscope does. Skin of every tone sits
-   near one line on the scope, so a face pushed off it toward green or magenta
-   gets corrected with the key's tint (`fix_tint=False` leaves the tint alone).
+The page is meant to be read from your chair, about 4 ft away: one instruction in
+big type, traffic lights for face and window, and a live preview of the shot that
+updates about once a second.
 
-If the key runs out of range, it says how to move it instead (half the
-distance is two stops more). `match_white` puts the camera and the lights on one
-colour temperature. While the camera records, `balance_shot` leaves the light
-alone.
+## What you need
 
-## Tools
+- A Sony FX30 on USB with PC Remote on (Menu > Network > PC Remote Function, PC
+  Remote On, connection method USB). Other Sony bodies that libgphoto2 drives
+  over PTP may work; only the FX30 has been tested.
+- An amaran light reachable over Bluetooth (tested with a 100x S; the PT2c also
+  works as a fill for `balance_shot`), through
+  [amaran-mcp](https://github.com/jtannahill/amaran-mcp). The light takes one
+  Bluetooth connection at a time: close the amaran or Sidus Link app on your
+  phone, or turn off the phone's Bluetooth.
+- A Mac. Face finding uses Apple's Vision framework.
+- Python 3.12 and [uv](https://docs.astral.sh/uv/).
+- Claude Code (or any MCP client).
+
+## Install
+
+Clone this repository and amaran-mcp side by side (fx30-mcp uses `../amaran-mcp`):
+
+```sh
+mkdir -p ~/src && cd ~/src
+git clone https://github.com/jtannahill/amaran-mcp
+git clone https://github.com/jtannahill/fx30-mcp
+cd fx30-mcp
+uv sync
+uv run fx30-mcp check          # connects, prints settings, meters one frame
+claude mcp add -s user fx30 -- uv --directory ~/src/fx30-mcp run fx30-mcp serve
+```
+
+Set up amaran-mcp's light first (see its README). Quit Image Capture and Sony's
+own apps before starting: only one program can hold the camera.
+
+`FX30_BACKEND=sim` swaps in a pretend camera and light for trying the tools
+without the gear. Settings live in `~/.config/fx30-mcp/settings.json`.
+
+## Using it
+
+Ask Claude to set up the shot. It calls `coach_shot` with what is on the light
+(bare, reflector, softbox, lantern or umbrella, and its size in inches for the
+last three; saved for next time) and hands you a QR code and a link to open on
+your phone. If the camera cannot report them, it also asks for the frame rate
+and the lens's widest aperture.
+
+Then follow the page until it says **Ready to record**, and press record on the
+camera (or ask Claude to). Record as many takes as you like: between takes the
+coach goes back to watching. It runs until you ask Claude to stop it, or 30
+minutes with nothing recorded.
+
+### Tools
 
 | Tool | What it does |
 |---|---|
@@ -35,74 +92,111 @@ alone.
 | `shot_status` | What the coach is doing (setup, take, stopped), what the page shows, the take so far and the last take's report |
 | `stop_coach` | Ends the coach and its page; camera and lights stay as they are |
 | `look` | Shows a live-view frame and meters the face against the target |
-| `balance_shot` | Lights the face to the target with the key light alone; never touches the camera |
+| `balance_shot` | Lights the face to the target with the key light alone; never touches the camera, and leaves the light alone while recording |
 | `set_face_target` | Saves the face brightness and skin colour to aim for: light it how you like, then call it with no level |
 | `match_white` | Light and camera to one colour temperature |
 | `set_lights` | The key light (on the face), the fill (on the shadow side) and the lighting ratio; with nothing given, lists the lights amaran Desktop has paired |
 | `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, exposure mode, recording state; set_camera reads each value back before reporting it |
 | `start_recording` / `stop_recording` | Record to the card; a running coach watches the take and carries on after it |
 
-## Shot coach
+### How a take is held
 
-Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). If the camera cannot report them, also give `frame_rate` (23.976 to 60; 24p plans on a 1/50 shutter) and `widest_aperture` (the lens's widest f-number); all of these are saved. It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. Natasha texts you the link too.
+When recording starts, the coach takes a snapshot of your face's brightness and
+colour and holds that through the take, rather than chasing a saved target. On
+each frame (about one a second):
 
-There is nothing to tap. The coach puts the camera in M and sets ISO, shutter and aperture itself over USB, confirming each by readback. It turns the key on and checks which side of your face it lights, asks you to move it if it is on the wrong side or the catchlight is off, and sees for itself when you have moved it. Then it balances the key until the page says Ready to record.
+- **Face brightness** follows with the key's brightness, at most a sixth of a
+  stop per second.
+- **Warmth and tint** are read as two numbers from the skin (blue to amber, green
+  to magenta). The key's colour temperature corrects the first, at most 100 K per
+  second; its tint corrects the second, one step at most every 5 s. The camera's
+  white balance never changes during a take.
+- **The window** is kept in range by the camera: one third of a stop at a time,
+  at most every 8 s, aperture first, then ISO, then shutter, each step paired with
+  the opposite change on the key.
+- **If you change the camera by hand**, the coach leaves the camera alone for the
+  rest of that take. If the camera refuses a step, the same. The light carries on.
+- **If your face leaves the frame**, nothing moves until it comes back.
 
-Then press record, on the camera or with `start_recording`. During a take the coach holds what recording started with: the key follows your face in brightness and colour, slowly enough not to show, and the camera steps one third of a stop at a time (aperture first, then ISO, then shutter) when the window brightens or darkens. If the face and the window cannot both be held, the face wins and the window is let clip. If you change the camera by hand mid-take, the coach leaves the camera alone for the rest of that take. When recording stops, the page shows the take's report and Natasha texts it to you; the coach goes back to watching for the next take. `shot_status` gives Claude the same state and the last report. It also texts when the light stops answering, the camera battery runs low, the camera overheats, a card has a problem, or the coach stops on an error.
+During setup, a setting the camera refuses over USB becomes an instruction on the
+page ("Set f/16 on the camera"), and the coach carries on once the camera reads
+it back.
 
-The coach runs until `stop_coach`, or 30 minutes with nothing recorded. `start_recording` and `stop_recording` only start and stop a take. For now the coach lights with the key only; a fill set with `set_lights` is left as it is.
+### Texts
 
-The 100x S is reached over Bluetooth, and it takes one connection at a time. When a light is slow to answer the page says "Connecting to the light" (it can take up to two minutes). If it cannot connect when the coach starts, `coach_shot` says so: close the amaran or Sidus Link app on your phone, or turn off the phone's Bluetooth, then start the coach again. If the light drops later, the coach keeps trying and texts you once.
+The coach can text you the page link when it starts, the report after every take,
+and warnings: the light stopped answering, the camera battery is low, the camera
+is overheating, a card has a problem, or the coach stopped on an error. Warnings
+of one kind are sent at most once every 10 minutes.
 
-Without an ND filter the plan stops the lens down to f/11, then f/16, then raises the shutter through 1/125, 1/250 and 1/500, and tells you when a bright window still cannot be held. `balance_shot` refuses while the coach runs; `stop_coach` ends it.
-
-## Setup
-
-On the FX30: Menu > Network > PC Remote Function, turn PC Remote on and set the
-connection method to USB. Plug it into the Mac. Quit Image Capture and Sony's
-apps, since only one program can hold the camera.
+Texts go out through Twilio. Put your credentials in an env file and point
+`FX30_TWILIO_ENV` at it (the default is `~/twilio-phone-tree/.env`):
 
 ```sh
-uv sync
-uv run fx30-mcp check          # connects, prints settings, meters one frame
-claude mcp add -s user fx30 -- uv --directory ~/src/fx30-mcp run fx30-mcp serve
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+MESSAGING_SERVICE_SID=MG...      # or TWILIO_PHONE_NUMBER=+1... to send from a number
+MY_PHONE_NUMBER=+1...            # where the texts go
 ```
 
-With several amaran lights paired in amaran Desktop, `set_lights` picks the key
-(say a 100x S) and the fill (say a PT2c), and the lighting ratio `fill_ratio`
-(1 is the classic 2:1 interview look, 2 is a moodier 4:1). `match_white` puts the
-camera and both lights on one colour temperature. `coach_shot` and
-`balance_shot` light with the key only for now and leave the fill as it is.
-
-The light comes from [amaran-mcp](https://github.com/jtannahill/amaran-mcp)
-(a sibling checkout in `../amaran-mcp`), through amaran Desktop when it is
-running, otherwise over Bluetooth.
-
-`FX30_BACKEND=sim` swaps in a pretend camera and light for trying the tools
-without the gear. Settings live in `~/.config/fx30-mcp/settings.json`.
+With no such file, or with `FX30_TEXTS=off`, nothing is sent. The token and phone
+numbers are never logged.
 
 ### Live view and log
 
-`profile` says how live view encodes brightness. With Gamma Display Assist on
-(or a Rec.709 picture profile) use `rec709`. If live view shows the flat S-Log3
+`profile` says how live view encodes brightness. With Gamma Display Assist on (or
+a Rec.709 picture profile) use `rec709`. If live view shows the flat S-Log3
 picture, use `slog3`. The default face targets (0.60 and 0.50) are starting
 points; `set_face_target` replaces them with a look you chose.
 
+## How it is built
+
+One loop, the director (`director.py`), runs from setup through every take: read
+the scene, decide, set, check.
+
+| Module | Role |
+|---|---|
+| `scene.py` | One frame and the camera's settings into one description: face box and turn, face level, cheeks, skin colour, clipping, the window, the camera's own meter. One decode and one Vision request per frame |
+| `decide.py` | A pure function from the scene, the rig's state, the goal and the mode (setup, balance, take) to the changes to make. All the judgment and all the take-mode limits live here, tested with tables |
+| `rig.py` | The camera and the key light behind `state()` and `apply()`; records every camera value it writes, so a change by hand can be told apart |
+| `director.py`, `report.py` | The loop, the page states, the after-take report and the warnings |
+| `plan.py`, `survey.py` | Where the key goes and the camera card, from a frame with the lights off |
+| `camera.py`, `sim.py` | libgphoto2 for the FX30, and a pretend camera and light for tests |
+| `notify.py`, `web.py` | Texts over Twilio; the phone page (Starlette, a random key in the link) |
+
+`uv run pytest` runs the suite against the pretend camera and light.
+
+## Known limits
+
+- **About one frame a second.** The FX30 sends a live-view frame over USB about
+  every 0.8 s. That is plenty for slow lighting changes and sets the preview's
+  pace. A faster loop or a smooth preview would need the camera's HDMI output
+  through a capture device.
+- **No ND filter.** Without one, a bright window is held by stopping down to
+  f/16 and then raising the shutter; the page says when the window still cannot
+  be held. A variable ND brings the shutter back to twice the frame rate.
+- **One Bluetooth connection.** The light takes one connection; finding it can
+  take a minute or two because it advertises rarely. During a run the coach holds
+  the connection, so the amaran phone app cannot reach the light.
+- **The camera can wedge.** If a program quits while it has the camera open, the
+  FX30 waits for it: turn the camera off and on (PC Remote stays on).
+- **Key light only.** The coach lights with one key; a fill set with `set_lights`
+  is used by `balance_shot` and otherwise left as it is.
+
 ## Status
 
-- Metering, the balancing loop and the tools are tested against the pretend
-  camera (`uv run pytest`), and face finding against a real portrait.
-- On the FX30 (Oct 27 2026, libgphoto2 2.5.34, Movie F Mode): it connects as a
-  generic PTP camera, reads ISO, shutter, aperture and white balance, sets
-  colour temperature (2500 to 9900K in 100K steps, read back to confirm) and
-  streams 1024x576 live view. Start and stop recording work (a test left one
-  clip on the card); both now wait for Sony's Movie Recording State to agree.
-- In Movie F Mode shutter and ISO come through read-only and the shutter
-  floats on Auto. The exposure mode (`expprogram`) is writable; in M (Oct 28
-  2026) shutter, ISO and aperture are all writable over USB, and recording
-  still starts and stops. Writes are taken at once but read back late (about a
-  second), so each write is confirmed by polling the readback for up to 3 s.
-- macOS's `ptpcamerad` claims the camera when it is plugged in. Opening the
-  camera stops it (launchd brings it back) and retries for a few seconds.
-- Sony's Camera Remote SDK also lists the FX30, and would plug in as another
-  `CameraBase` in `camera.py` if something here falls short.
+- Tested on the owner's FX30 (libgphoto2 2.5.34): live view at 1024x576,
+  exposure mode M with aperture, shutter and ISO writable over USB (each write
+  confirmed by readback, which lags about a second), colour temperature 2500 to
+  9900 K, recording start and stop, and live view during recording.
+- The shot coach reached Ready on real gear on 2026-10-29. The director (setup
+  without taps, take monitoring, reports and texts) is tested against the pretend
+  camera; its first hardware session is next, to confirm the camera meter's unit,
+  measure how closely a paired light change lands against a camera step, and tune
+  the colour gains.
+- macOS's `ptpcamerad` claims the camera when it is plugged in. Opening the camera
+  stops it (launchd brings it back) and retries for a few seconds.
+
+## License
+
+MIT.

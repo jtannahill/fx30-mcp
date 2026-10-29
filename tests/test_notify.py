@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from fx30_mcp import notify
-from fx30_mcp.notify import Limited, NatashaTexts, RecordedTexts
+from fx30_mcp.notify import Limited, TwilioTexts, RecordedTexts
 
 TOKEN = "tok-fake-123"
 NUMBER = "+15550001111"
@@ -29,7 +29,7 @@ def test_env_is_parsed_and_the_message_posted(tmp_path):
         calls.append((url, data, auth))
         return {}
 
-    texts = NatashaTexts(_env(tmp_path), post=post)
+    texts = TwilioTexts(_env(tmp_path), post=post)
     asyncio.run(texts.send("link", "hello there"))
     (url, data, auth), = calls
     assert url == "https://api.twilio.com/2010-04-01/Accounts/ACfake/Messages.json"
@@ -42,7 +42,7 @@ def test_env_is_parsed_and_the_message_posted(tmp_path):
 def test_phone_number_is_the_from_without_a_messaging_service(tmp_path):
     text = ENV.replace("TWILIO_MESSAGING_SERVICE_SID=MGfake", "TWILIO_PHONE_NUMBER=+15559998888")
     calls = []
-    texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
+    texts = TwilioTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
     asyncio.run(texts.send("report", "x"))
     assert calls[0]["From"] == "+15559998888"
     assert "MessagingServiceSid" not in calls[0]
@@ -52,7 +52,7 @@ def test_a_send_failure_is_swallowed_and_logged_without_secrets(tmp_path, caplog
     def post(url, data, auth):
         raise RuntimeError(f"boom {TOKEN} {NUMBER}")
 
-    texts = NatashaTexts(_env(tmp_path), post=post)
+    texts = TwilioTexts(_env(tmp_path), post=post)
     with caplog.at_level(logging.DEBUG):
         asyncio.run(texts.send("overheat", "hot"))
     assert "overheat" in caplog.text
@@ -61,7 +61,7 @@ def test_a_send_failure_is_swallowed_and_logged_without_secrets(tmp_path, caplog
 
 
 def test_a_missing_env_file_is_swallowed(tmp_path):
-    texts = NatashaTexts(tmp_path / "nope.env", post=lambda u, d, a: {})
+    texts = TwilioTexts(tmp_path / "nope.env", post=lambda u, d, a: {})
     asyncio.run(texts.send("link", "x"))
 
 
@@ -109,16 +109,27 @@ def test_texts_off_uses_recorded(monkeypatch):
     assert isinstance(notify.texts_for_server()._texts, RecordedTexts)
 
 
-def test_real_sender_otherwise(monkeypatch):
+def test_real_sender_when_the_credentials_file_exists(monkeypatch, tmp_path):
+    env = tmp_path / "twilio.env"
+    env.write_text(ENV)
     monkeypatch.delenv("FX30_BACKEND", raising=False)
     monkeypatch.delenv("FX30_TEXTS", raising=False)
-    assert isinstance(notify.texts_for_server()._texts, NatashaTexts)
+    monkeypatch.setenv("FX30_TWILIO_ENV", str(env))
+    sender = notify.texts_for_server()._texts
+    assert isinstance(sender, TwilioTexts) and sender._env_path == env
+
+
+def test_no_credentials_file_means_no_texts(monkeypatch, tmp_path):
+    monkeypatch.delenv("FX30_BACKEND", raising=False)
+    monkeypatch.delenv("FX30_TEXTS", raising=False)
+    monkeypatch.setenv("FX30_TWILIO_ENV", str(tmp_path / "missing.env"))
+    assert isinstance(notify.texts_for_server()._texts, RecordedTexts)
 
 
 def test_messaging_service_sid_key_is_used(tmp_path):
     text = ENV.replace("TWILIO_MESSAGING_SERVICE_SID=MGfake", "MESSAGING_SERVICE_SID=MGplain")
     calls = []
-    texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
+    texts = TwilioTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
     asyncio.run(texts.send("link", "x"))
     assert calls[0]["MessagingServiceSid"] == "MGplain"
 
@@ -126,7 +137,7 @@ def test_messaging_service_sid_key_is_used(tmp_path):
 def test_a_repeated_key_takes_its_last_value(tmp_path):
     text = ENV + "MESSAGING_SERVICE_SID=MGfirst\nMESSAGING_SERVICE_SID=MGlast\n"
     calls = []
-    texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
+    texts = TwilioTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
     asyncio.run(texts.send("link", "x"))
     assert calls[0]["MessagingServiceSid"] == "MGlast"
 

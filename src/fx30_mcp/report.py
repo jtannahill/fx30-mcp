@@ -84,7 +84,7 @@ def capital(text: str) -> str:
 
 
 def report_text(report: dict[str, Any]) -> str:
-    """The take's report as one short text, for the page and for Natasha."""
+    """The take's report as one short text, for the page and for the text."""
 
     held = report.get("held") or {}
     parts = [f"Take {report['take']}: {_duration(report['seconds'])}."]

@@ -527,7 +527,7 @@ class Director:
         self._take = None
         return {**report, "text": report_text(report)}
 
-    # What the page shows, and what Natasha says.
+    # What the page shows, and what the text says.
 
     def _screen(self, moves: Moves) -> str:
         """The report stays up between takes until there is something to do (sitting back down aside)."""

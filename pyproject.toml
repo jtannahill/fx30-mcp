@@ -1,8 +1,10 @@
 [project]
 name = "fx30-mcp"
 version = "0.1.0"
-description = "Control a Sony FX30 from Claude Code and light a one-person talking head with an amaran light"
+description = "Set up and watch a one-person talking-head shot with a Sony FX30 and an amaran light, from Claude Code"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "jtannahill", email = "161522526+jtannahill@users.noreply.github.com" }
 ]
