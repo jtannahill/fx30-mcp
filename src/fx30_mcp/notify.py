@@ -88,6 +88,25 @@ class NatashaTexts:
         self._post(_URL.format(sid=sid), data, (sid, token))
 
 
+async def _quietly(texts: Texts, kind: str, body: str) -> None:
+    try:
+        await texts.send(kind, body)
+    except Exception as error:
+        log.warning("text %r not sent: %s", kind, type(error).__name__)
+
+
+def send_later(texts: Texts, kind: str, body: str, pending: set[asyncio.Task]) -> None:
+    """Send without waiting: a Twilio call can take 15 s, and the director must not.
+
+    The send starts at once (a pretend sender has it before this returns) and finishes in the
+    background; pending keeps a reference until then. A failure is logged, never raised."""
+
+    task = asyncio.Task(_quietly(texts, kind, body), loop=asyncio.get_running_loop(), eager_start=True)
+    if not task.done():
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+
 class RecordedTexts:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []

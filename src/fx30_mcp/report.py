@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 WINDOW_CLIPPING = "window clipping; "
+REFUSED = "camera refused "
 QUIET_HELD = {"no snapshot", "camera changed by hand"}  # said elsewhere in the report, or not worth saying
 
 
@@ -16,6 +17,10 @@ class Take:
     meter: float | None  # the camera's meter at record start (or once the face was back)
     last: float  # the time of the last tick, so each tick counts the seconds since the one before
     meter_now: float | None = None
+    # The camera's exposure in stops at the same two moments: the meter reads through the lens, so the
+    # camera's own changes are added back to tell how much the scene itself changed.
+    exposure: float | None = None
+    exposure_now: float | None = None
     face_off: float = 0.0
     window_red: float = 0.0
     window_red_now: bool = False
@@ -23,11 +28,15 @@ class Take:
     held: dict[str, float] = field(default_factory=dict)
     light_errors: int = 0
 
-    def tick(self, now: float, meter: float | None, face_green: bool, window_red: bool, held: str | None) -> None:
+    def tick(
+        self, now: float, meter: float | None, face_green: bool, window_red: bool, held: str | None,
+        exposure: float | None = None,
+    ) -> None:
         """Count the seconds since the last tick toward what this tick saw."""
 
         dt, self.last = now - self.last, now
         self.meter_now = meter
+        self.exposure_now = exposure
         if not face_green:
             self.face_off += dt
         self.window_red_now = window_red
@@ -38,10 +47,13 @@ class Take:
 
     def report(self, now: float, hands_off: bool) -> dict[str, Any]:
         start, end = self.meter, self.meter_now
+        change = None if start is None or end is None else end - start
+        if change is not None and self.exposure is not None and self.exposure_now is not None:
+            change -= self.exposure_now - self.exposure  # a camera stepped darker hid that much brightening
         return {
             "take": self.number,
             "seconds": round(now - self.started, 1),
-            "meter_change": None if start is None or end is None else round(end - start, 2),
+            "meter_change": None if change is None else round(change, 2),  # the scene's change, in stops
             "face_off_seconds": round(self.face_off, 1),
             "window_red_seconds": round(self.window_red, 1),
             "window_red_at_end": self.window_red_now,
@@ -99,6 +111,10 @@ def report_text(report: dict[str, Any]) -> str:
     if report["light_errors"]:
         parts.append(f"The light stopped answering {_times(report['light_errors'])}.")
     for reason, seconds in held.items():
+        if reason.startswith(REFUSED):
+            value = reason[len(REFUSED) :]
+            parts.append(f"The camera refused {value}, so the director stopped stepping it for the take.")
+            continue
         if reason.startswith(WINDOW_CLIPPING) or reason in QUIET_HELD:
             continue
         what = "Out of the frame" if reason == "no face" else capital(_past(reason))

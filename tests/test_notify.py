@@ -129,3 +129,32 @@ def test_a_repeated_key_takes_its_last_value(tmp_path):
     texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
     asyncio.run(texts.send("link", "x"))
     assert calls[0]["MessagingServiceSid"] == "MGlast"
+
+
+def test_send_later_starts_at_once_and_does_not_wait(caplog):
+    class Stuck:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, kind, body):
+            self.sent.append((kind, body))
+            await asyncio.Event().wait()
+
+    class Broken:
+        async def send(self, kind, body):
+            raise RuntimeError(f"no network {TOKEN}")
+
+    async def go():
+        pending: set = set()
+        recorded, stuck = RecordedTexts(), Stuck()
+        notify.send_later(recorded, "report", "Take 1", pending)
+        notify.send_later(stuck, "link", "url", pending)
+        assert recorded.sent == [("report", "Take 1")] and stuck.sent == [("link", "url")]
+        assert len(pending) == 1  # the stuck one, kept so it is not collected mid-send
+        with caplog.at_level(logging.WARNING):
+            notify.send_later(Broken(), "stopped", "body", pending)
+        assert "RuntimeError" in caplog.text and TOKEN not in caplog.text
+        for task in pending:
+            task.cancel()
+
+    asyncio.run(go())

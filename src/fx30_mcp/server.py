@@ -23,12 +23,13 @@ from .camera import CameraBase, CameraError, GPhotoCamera
 from .config import Settings
 from .decide import UNREACHABLE
 from .director import Director
-from .notify import Texts, texts_for_server
+from .notify import Texts, send_later, texts_for_server
 from .rig import LightError, LightUnreachable, Rig
 from .web import Broadcaster, WebHandle, start_web
 
 log = logging.getLogger(__name__)
 BLUETOOTH_HOLD_SECONDS = 600.0
+STOP_WAIT_SECONDS = 2.0  # stop_coach lets the run finish its tick (and report a take) before cancelling it
 
 BACKEND = os.environ.get("FX30_BACKEND", "gphoto2").lower()
 
@@ -40,6 +41,7 @@ _director: Director | None = None  # the coach_shot run, from start until stop_c
 _web: WebHandle | None = None
 _run_task: asyncio.Task | None = None  # the survey while starting, then Director.run()
 _holds_busy = False  # True while a coach_shot run (not a balance) holds _busy
+_sending: set[asyncio.Task] = set()  # coach_shot's link text, sent in the background
 FILL_NOTE = "The director lights with the key only for now; the fill is left as it is."
 MODIFIERS = ("bare", "reflector", "softbox", "lantern", "umbrella")
 SIZED = ("softbox", "lantern", "umbrella")
@@ -277,7 +279,7 @@ async def balance_shot(
     if _run_task is not None and not _run_task.done():
         raise ToolError("the shot coach is running; stop_coach first")
     if _busy.locked():
-        raise ToolError("a balance is already running")
+        raise ToolError("a balance or the shot coach is already running")
     async with _busy:
         await take_over_light()
         director = _new_director(config.load(), lambda _state: None, _NoTexts(), camera_moves=False)
@@ -416,6 +418,9 @@ async def _end_run() -> bool:
     try:
         director.stop()
         if task is not None and not task.done():
+            # Stopped at the top of its next tick, the run reports an open take and shows it ended;
+            # a tick stuck on a Bluetooth connect is cancelled, and reports the take on the way out.
+            await asyncio.wait({task}, timeout=STOP_WAIT_SECONDS)
             task.cancel()
             try:
                 await task
@@ -518,7 +523,7 @@ async def coach_shot(
         _web = web
         _run_task = asyncio.create_task(director.run())
         _run_task.add_done_callback(_run_finished)
-        await texts.send("link", f"Shot coach: {web.url}")
+        send_later(texts, "link", f"Shot coach: {web.url}", _sending)
     except BaseException:
         if _director is director:
             await _end_run()

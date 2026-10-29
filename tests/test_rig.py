@@ -1,9 +1,11 @@
 import asyncio
+import heapq
 from types import SimpleNamespace
 
 import pytest
 
 from fx30_mcp import rig as rig_module
+from fx30_mcp.camera import CameraError
 from fx30_mcp.decide import CameraMove, History, LightMove, Moves
 from fx30_mcp.rig import LightError, LightUnreachable, Rig
 
@@ -159,3 +161,108 @@ def test_state_reads_the_key_when_unknown():
     key = FakeKey(log, power=None)
     asyncio.run(make(log, key=key).state())
     assert ("key.read_status",) in log
+
+
+class Virtual:
+    """Fake time for sleeps that run side by side: run() moves the clock to the next wake-up once
+    every task is waiting."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self._wakes: list = []
+        self._n = 0
+
+    def __call__(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds):
+        future = asyncio.get_running_loop().create_future()
+        self._n += 1
+        heapq.heappush(self._wakes, (self.t + seconds, self._n, future))
+        await future
+
+    async def run(self, coro):
+        task = asyncio.ensure_future(coro)
+        while True:
+            for _ in range(20):
+                await asyncio.sleep(0)
+            if task.done():
+                return task.result()
+            when, _n, future = heapq.heappop(self._wakes)
+            self.t = max(self.t, when)
+            future.set_result(None)
+
+
+class SlowCamera(FakeCamera):
+    """set() takes a second (the camera reading the value back), and can refuse at the end of it."""
+
+    def __init__(self, log, clock, refuse=False, after=1.0):
+        super().__init__(log)
+        self.clock = clock
+        self.refuse = refuse
+        self.after = after
+
+    async def set(self, setting, value):
+        self.log.append(("camera.set", setting, value, self.clock()))
+        await self.clock.sleep(self.after)
+        if self.refuse:
+            raise CameraError(f"{setting} {value!r} is not offered")
+        return value
+
+
+class TimedKey(FakeKey):
+    def __init__(self, log, clock):
+        super().__init__(log)
+        self.clock = clock
+
+    async def set_white(self, kelvin, brightness, tint):
+        self.log.append(("key.set_white", kelvin, brightness, tint, self.clock()))
+        self.state.kelvin, self.state.brightness, self.state.tint = kelvin, brightness, tint
+
+
+def paired(log, clock, **camera):
+    return Rig(SlowCamera(log, clock, **camera), TimedKey(log, clock), on_slow=lambda: None, on_back=lambda: None,
+               pair_delay=0.3, clock=clock, sleep=clock.sleep)
+
+
+def test_the_paired_light_starts_pair_delay_after_the_camera_write_began():
+    log, clock, history = [], Virtual(), History()
+    asyncio.run(clock.run(paired(log, clock).apply(MOVES, history)))
+    assert log == [("camera.set", "aperture", "f/14", 0.0), ("key.set_white", 5600, 60.0, 0, 0.3)]
+    assert history.commanded == {"aperture": "f/14"}
+    assert history.last_camera_step == 1.0  # once the camera read it back
+
+
+def test_a_refused_paired_step_puts_the_light_back():
+    log, clock, history = [], Virtual(), History()
+    with pytest.raises(CameraError):
+        asyncio.run(clock.run(paired(log, clock, refuse=True).apply(MOVES, history)))
+    assert log == [
+        ("camera.set", "aperture", "f/14", 0.0),
+        ("key.set_white", 5600, 60.0, 0, 0.3),
+        ("key.set_white", 5600, 40.0, 0, 1.0),  # back where it was
+    ]
+    assert history.commanded == {} and history.last_camera_step == float("-inf")
+
+
+def test_a_step_refused_before_the_light_moves_leaves_the_light_alone():
+    log, clock, history = [], Virtual(), History()
+    with pytest.raises(CameraError):
+        asyncio.run(clock.run(paired(log, clock, refuse=True, after=0.1).apply(MOVES, history)))
+    assert log == [("camera.set", "aperture", "f/14", 0.0)]
+    assert history.commanded == {}
+
+
+def test_state_keeps_a_failed_light_read():
+    log = []
+
+    class Unreachable(FakeKey):
+        async def read_status(self):
+            raise RuntimeError("could not connect to the light")
+
+    r = make(log, key=Unreachable(log, power=None))
+    asyncio.run(r.state())
+    assert isinstance(r.light_error, LightUnreachable)
+    r.key._light.state.power = True
+    asyncio.run(r.state())
+    assert r.light_error is None

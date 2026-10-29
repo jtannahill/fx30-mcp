@@ -415,3 +415,17 @@ def test_a_take_without_a_snapshot_holds():
 def test_unknown_mode_is_refused():
     with pytest.raises(ValueError):
         decide(make_scene(), make_rig(), make_goal(), "rehearse", taking(), NOW)
+
+
+def test_a_refused_camera_step_stops_camera_moves_for_the_take():
+    history = taking(camera_refused="camera refused f/14")
+    moves = go(scene=make_scene(level=level_for(1.0), window=CLIPPING), history=history)
+    assert moves.camera is None
+    assert moves.held == "camera refused f/14"
+    assert moves.light is not None  # the light still follows the face
+
+
+def test_start_take_forgets_the_last_takes_refusal():
+    history = History(camera_refused="camera refused f/14")
+    start_take(make_scene(), history)
+    assert history.camera_refused is None

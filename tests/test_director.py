@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from amaran_mcp.link import LinkError
@@ -8,7 +9,7 @@ from fx30_mcp.camera import CameraError
 from fx30_mcp.config import Settings
 from fx30_mcp.director import IDLE_END_SECONDS, Director
 from fx30_mcp.plan import exposure_of
-from fx30_mcp.report import report_text
+from fx30_mcp.report import Take, report_text
 from fx30_mcp.notify import RecordedTexts
 from fx30_mcp.rig import Rig
 from fx30_mcp.sim import SimCamera, SimLight
@@ -59,8 +60,12 @@ class Watched(SimCamera):
         self.unheld_frames = 0
         self.battery = 100
         self.fail_frames = False
+        self.refuse: set[str] = set()  # values set() refuses, as a lens without f/22 would
+        self.record_on_frame = False  # recording starts during the next frame read
 
     async def set(self, setting, value):
+        if value in self.refuse:
+            raise CameraError(f"{setting} {value!r} is not offered")
         self.sets.append((self.clock(), setting, value))
         return await super().set(setting, value)
 
@@ -75,6 +80,9 @@ class Watched(SimCamera):
             raise CameraError("The camera stopped answering.")
         if not (self.holds and self.holds[-1]):
             self.unheld_frames += 1
+        if self.record_on_frame:
+            self.record_on_frame = False
+            self.recording = True
         jpeg = await super().frame()
         if self.recording:
             self.levels.append((self.clock(), meter.read(jpeg, SIM_FACE).lit))
@@ -588,13 +596,16 @@ def test_settle_puts_the_key_at_the_given_kelvin_and_leaves_the_cameras_white_ba
 
 def test_settle_with_an_unreachable_light_says_close_the_app_once():
     camera, key = sim(aperture="f/11")
+    attempts = []
 
     async def broken(*_args, **_kwargs):
+        attempts.append(1)
         raise LinkError("could not connect to the light")
 
     key.set_white = broken
     director, states, texts, clock = make(camera, key, camera_moves=False)
     result = asyncio.run(director.settle(3))
+    assert len(attempts) == 1  # each attempt can be a two-minute Bluetooth connect: one, then it says so
     assert result["done"] is False
     assert result["notes"] == [
         "The light isn't answering. If the amaran or Sidus Link app is open on your phone, close it "
@@ -715,3 +726,232 @@ def test_unexpected_error_says_so_and_reraises():
     assert states[-1]["detail"] == "Something went wrong: RuntimeError."
     assert director.running is False
     assert [kind for kind, _ in texts.sent] == ["stopped"]
+
+
+# A refused camera write, a run ending mid-take, the light's link, texts in the background.
+
+
+def test_a_refused_step_mid_take_is_held_and_the_run_carries_on():
+    camera, key = sim(stops_at_full=2.0, curve=1.0)
+    camera.refuse = {"f/7.1"}  # the first step down from f/6.3
+    director, states, texts, clock = make(camera, key)
+    mark = {}
+
+    def then(s: float) -> None:
+        if s >= 1 and "start" not in mark:
+            camera.recording = True
+            mark["start"] = clock.t
+        if s >= 5:
+            camera.window = min(4.0 * 2 ** ((s - 5) / 15), 12.0)
+        if s >= 40 and "end" not in mark:
+            camera.recording = False
+            mark["end"] = clock.t
+        if s > 45:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    assert not [s for s in camera.sets if mark["start"] <= s[0] < mark["end"]]
+    assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
+    assert "stopped" not in [kind for kind, _ in texts.sent]
+    report = director.status()["last_report"]
+    assert "camera refused f/7.1" in report["held"]
+    assert "The camera refused f/7.1" in report["text"]
+    assert any(s["screen"] == "take" and s["detail"] == "Camera refused f/7.1" for s in states)
+    snapshot = director.history.snapshot[0]
+    assert all(abs(meter.stops_off(level, snapshot, "rec709")) <= 1 / 6 for _t, level in camera.levels)
+
+
+def test_a_refused_setup_write_is_asked_for_by_hand():
+    camera, key = sim()
+    camera.values["aperture"] = "f/2.8"  # opened up after calibrating: the card walks f/4, f/5.6, f/8, f/6.3
+    camera.refuse = {"f/4"}
+    director, states, texts, clock = make(camera, key)
+    seen = {}
+
+    def script(t: float) -> None:
+        if director.status()["instruction"] == "Set f/4 on the camera":
+            seen.setdefault("t", t)
+            if t - seen["t"] >= 2:
+                camera.values["aperture"] = "f/4"  # the owner turns the ring
+        if director.status()["step"] == "ready":
+            director.stop()
+
+    go(director, clock, script)
+    shown = [(s["step"], s["instruction"], s["detail"]) for s in states]
+    asked = shown.index(("camera", "Set f/4 on the camera", "Aperture"))
+    assert ("ready", "Ready to record", None) in shown[asked:]
+    assert "f/4" not in [value for _t, setting, value in camera.sets if setting == "aperture"]
+    assert camera.values["aperture"] == SETTLED  # the rest of the card went over USB
+    assert director.history.refused == {}
+    assert texts.sent == []
+
+
+def test_a_run_that_fails_mid_take_still_reports_the_take():
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+
+    def then(s: float) -> None:
+        camera.recording = s >= 1
+        if s >= 10:
+            camera.fail_frames = True
+
+    go(director, clock, after_ready(director, then))
+    assert states[-1]["instruction"] == "Camera stopped answering"
+    report = director.status()["last_report"]
+    assert report is not None and report["take"] == 1
+    assert [kind for kind, _ in texts.sent] == ["report", "stopped"]
+    assert texts.sent[0][1] == report["text"]
+
+
+def test_a_stop_mid_take_shows_the_report():
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+
+    def then(s: float) -> None:
+        camera.recording = s >= 1
+        if s >= 10:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    report = director.status()["last_report"]
+    assert [kind for kind, _ in texts.sent] == ["report"]
+    assert states[-1]["step"] == "stopped" and states[-1]["screen"] == "report"
+    assert states[-1]["report"] == report
+
+
+def test_the_lights_link_is_held_for_the_run():
+    camera, key = sim()
+    key.link = SimpleNamespace(idle_timeout=30.0)
+    director, states, texts, clock = make(camera, key)
+    held = []
+    go(director, clock, after_ready(director, lambda _s: held.append(key.link.idle_timeout) or director.stop()))
+    assert held and set(held) == {IDLE_END_SECONDS + 60}
+    assert key.link.idle_timeout == 30.0
+
+
+class Stuck:
+    """A text sender that never finishes, as a hung Twilio call would."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, kind, body):
+        self.sent.append((kind, body))
+        await asyncio.Event().wait()
+
+
+def test_a_slow_text_does_not_hold_up_the_loop():
+    camera, key = sim()
+    camera.battery = 12
+    director, states, texts, clock = make(camera, key)
+    director.texts = stuck = Stuck()
+    clock.script = after_ready(director, lambda s: s > 3 and director.stop())
+
+    async def main():
+        await director.start()
+        await asyncio.wait_for(director.run(), 5)
+
+    asyncio.run(main())
+    assert stuck.sent == [("battery", "The camera battery is at 12%.")]
+    assert ("ready", "Ready to record") in [(s["step"], s["instruction"]) for s in states]
+
+
+def test_a_text_that_fails_never_stops_the_run():
+    camera, key = sim()
+    camera.battery = 12
+    director, states, texts, clock = make(camera, key)
+
+    class Broken:
+        async def send(self, kind, body):
+            raise RuntimeError("twilio down")
+
+    director.texts = Broken()
+    go(director, clock, after_ready(director, lambda s: s > 3 and director.stop()))
+    assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
+
+
+def test_the_report_adds_back_the_directors_own_camera_steps():
+    # The scene brightened a stop; the director stepped the camera a stop down, so the meter barely moved.
+    take = Take(1, 0.0, 2.0, 0.0, exposure=0.0)
+    take.tick(30.0, 2.0, True, False, None, exposure=-1.0)
+    report = take.report(30.0, False)
+    assert report["meter_change"] == 1.0
+    assert "The scene got 1 stop brighter." in report_text(report)
+
+
+def test_the_director_tells_the_report_its_exposure():
+    camera, key = sim(stops_at_full=2.0, curve=1.0)
+    director, states, texts, clock = make(camera, key)
+
+    def then(s: float) -> None:
+        camera.recording = 1 <= s < 60
+        if s >= 5:
+            camera.window = min(4.0 * 2 ** ((s - 5) / 15), 12.0)
+        if s > 62:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    report = director.status()["last_report"]
+    assert report["camera_steps"] >= 3
+    # The sim's meter sees the key's light; each paired step raised the key a third of a stop while the
+    # camera went a third darker, so the meter alone barely moves. Added back, the light got brighter.
+    assert report["meter_change"] > report["camera_steps"] / 3 - 0.2
+
+
+def test_balance_without_a_kelvin_keeps_the_keys_own_when_it_must_be_read():
+    camera, key = sim(aperture="f/11")
+    key.state.kelvin = None  # not read yet: the light says 3200 when asked
+
+    async def read_status():
+        key.state.kelvin = 3200
+        return {}
+
+    key.read_status = read_status
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(5))
+    assert director.goal.kelvin == 3200
+    assert result["light"]["kelvin"] == 3200
+
+
+def test_settle_reads_an_unreachable_light_once():
+    camera, key = sim(aperture="f/11")
+    key.state.power = None
+    attempts = []
+
+    async def read_status():
+        attempts.append("read")
+        raise LinkError("could not connect to the light")
+
+    async def broken(*_args, **_kwargs):
+        attempts.append("write")
+        raise LinkError("could not connect to the light")
+
+    key.read_status = read_status
+    key.set_white = broken
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(5))
+    assert attempts == ["read"]
+    assert result["done"] is False and "call balance_shot again" in result["notes"][0]
+
+
+def test_no_key_check_once_recording_has_started():
+    camera, key = sim(exposure_mode="M")
+    director, states, texts, clock = make(camera, key)
+
+    def script(t: float) -> None:
+        if t > 6:
+            director.stop()
+
+    clock.script = script
+
+    async def main():
+        await director.start()
+        camera.kelvin = director.plan.kelvin  # the camera is already set: the first tick would check the key
+        camera.record_on_frame = True  # recording starts after this tick's settings were read
+        before = len(key.powers)
+        await asyncio.wait_for(director.run(), 20)
+        return before
+
+    before = asyncio.run(main())
+    assert director.status()["last_report"]["take"] == 1
+    assert not [on for _t, on in key.powers[before:] if not on]  # the key never went off mid-take

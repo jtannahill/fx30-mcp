@@ -5,7 +5,10 @@ do it. Setup brings the shot to Ready with no taps; the director runs the key ch
 check itself, the experiments decide cannot make. When the camera starts recording the loop switches to
 take mode and holds what recording started with; when it stops, the take's report goes to the page and
 by text, and setup watches for the next take. The run ends on stop(), after IDLE_END_SECONDS without
-recording, or on a camera error. Every change of what the page should show goes out through publish.
+recording, or when the camera stops answering a read; a run that ends mid-take still reports the take.
+A camera write the camera refuses does not end it: setup asks for the value by hand, a take stops
+stepping the camera. Every change of what the page should show goes out through publish; texts go out
+in the background, so a slow send never holds up the loop.
 With camera_moves off (balance_shot) setup runs decide's balance mode: the light alone, no key check.
 """
 
@@ -22,6 +25,7 @@ from .camera import CameraError
 from .config import Settings
 from .decide import (
     CONNECTING,
+    LABELS,
     NO_FACE,
     Ask,
     Goal,
@@ -29,12 +33,13 @@ from .decide import (
     Moves,
     RigState,
     _number,
+    by_hand,
     canonical,
     decide,
     key_placed,
     start_take,
 )
-from .notify import Texts
+from .notify import Texts, send_later
 from .plan import Plan, _widest_offered, exposure_of, face_light, key_geometry, make_plan, window_light
 from .rig import LightError, LightUnreachable, Rig
 from .report import Take, capital, report_text
@@ -50,7 +55,7 @@ LOW_BATTERY = 15  # percent
 MOVED_STOPS = 1 / 3  # the face or its cheeks changing this much under a key ask: the key was moved
 CARD = ("iso", "shutter", "aperture")
 ASSUMED = {"iso": "800", "shutter": "1/60", "aperture": "f/2.8"}  # planned from when the camera cannot say
-LABELS = {"aperture": "Aperture", "shutter": "Shutter", "iso": "ISO", "kelvin": "White balance"}
+LINK_HOLD_SECONDS = IDLE_END_SECONDS + 60  # the light's Bluetooth link stays up through a whole run
 SETTING_LIGHT = ("Hold still", "Setting the light.")
 RETRYING = (
     "The light isn't answering",
@@ -66,6 +71,15 @@ BALANCE_UNREACHABLE = (
 
 class _Stopped(Exception):
     pass
+
+
+def _exposure(camera: dict[str, Any]) -> float | None:
+    """Stops of exposure from the camera's readback, which comes in several forms ("ISO 800", '1/60"', "6.3")."""
+
+    try:
+        return exposure_of(*(canonical(s, camera[s]) for s in ("iso", "shutter", "aperture")))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 class Director:
@@ -116,6 +130,7 @@ class Director:
         self._last_ask: Ask | None = None
         self._idle_since = 0.0
         self._before_connecting: dict | None = None
+        self._sending: set[asyncio.Task] = set()
 
     def stop(self) -> None:
         self._stopping = True
@@ -154,12 +169,17 @@ class Director:
         return self.plan
 
     async def run(self) -> None:
-        """Setup and takes until stop(), IDLE_END_SECONDS without recording, or a camera error."""
+        """Setup and takes until stop(), IDLE_END_SECONDS without recording, or a camera read failing.
+        However it ends, a take still open is reported first, before anything cancellation could cut."""
 
         if self.plan is None:
             return
         self.running = True
         self._hold(True)
+        link = getattr(self.rig.key, "link", None)
+        hold_was = getattr(link, "idle_timeout", None)
+        if hold_was is not None:
+            link.idle_timeout = LINK_HOLD_SECONDS  # a reconnect mid-take would stall the loop for a minute
         self._idle_since = self.clock()
         try:
             while True:
@@ -170,16 +190,22 @@ class Director:
                     return
                 await self.sleep(self.take_interval if self.mode == "take" else self._settle)
         except _Stopped:
-            if self._take is not None:
-                self.last_report = self._finish_take()
-            self._show("stopped", "Coach stopped", None)
+            report = self._close_take()
+            self._show("stopped", "Coach stopped", None, screen="coach" if report is None else "report")
         except CameraError as err:
+            self._close_take()
             # The camera layer already says what to do: a timeout carries the power-cycle hint.
-            await self._fail("Camera stopped answering", str(err))
+            self._fail("Camera stopped answering", str(err))
+        except asyncio.CancelledError:
+            self._close_take()
+            raise
         except Exception as err:
-            await self._fail("Coach stopped", f"Something went wrong: {type(err).__name__}.")
+            self._close_take()
+            self._fail("Coach stopped", f"Something went wrong: {type(err).__name__}.")
             raise
         finally:
+            if hold_was is not None:
+                link.idle_timeout = hold_was
             self.running = False
             self.mode = "stopped"
             self._hold(False)
@@ -198,18 +224,28 @@ class Director:
             if (await self.rig.camera.settings()).get("recording"):
                 notes.append(RECORDING_NOTE)
             elif self.goal is None and not self.camera_moves:
-                self.goal = self._light_goal(kelvin)
+                await self.rig.state()  # reads the key when its state is not known yet, for its kelvin
+                if self.rig.light_error is not None:
+                    self._light_failed(self.rig.light_error)
+                else:
+                    self.goal = self._light_goal(kelvin)
             elif self.goal is None and await self.start() is None:
                 self._last_ask = Ask(*NO_FACE)
             if self.goal is not None and self.goal.fix_tint != fix_tint:
                 self.goal = dataclasses.replace(self.goal, fix_tint=fix_tint)
+            # One light failure ends it: each try can be a two-minute Bluetooth connect, holding _busy.
             while self.goal is not None and not notes and max_ticks > 0 and not self._stopping:
                 max_ticks -= 1
                 scene, rig, now = await self._read()
                 if scene.camera.get("recording"):
                     notes.append(RECORDING_NOTE)
                     break
+                if self.rig.light_error is not None:
+                    self._light_failed(self.rig.light_error)
+                    break
                 await self._setup_tick(scene, rig, now)
+                if self._light_problem is not None:
+                    break
                 if self.state.get("step") == "ready":
                     done = True
                     break
@@ -289,7 +325,7 @@ class Director:
     async def _read(self) -> tuple[Scene, RigState, float]:
         now = self.clock()
         rig = await self.rig.state()
-        await self._warn_camera(rig.camera)
+        self._warn_camera(rig.camera)
         frame = await self.rig.camera.frame()
         self.latest_frame = frame
         scene = await asyncio.to_thread(read_scene, frame, rig.camera, self.profile)
@@ -301,7 +337,7 @@ class Director:
         if recording and self.mode != "take":
             self._begin_take(scene, now)
         elif not recording and self.mode == "take":
-            await self._end_take(scene, now)
+            self._end_take(scene, now)
         if self.mode == "take":
             await self._take_tick(scene, rig, now)
         else:
@@ -313,24 +349,33 @@ class Director:
         moves = decide(scene, rig, goal, "balance" if light_only else "setup", history, now)
         history.last_tick = now
         self._last_ask = moves.ask
-        if scene.face and moves.camera is None:
+        asked_by_hand = by_hand(moves.ask)  # the camera refused a value: the card is not right yet
+        if scene.face and moves.camera is None and not asked_by_hand:
             self._card_right = True
         try:
             if not light_only and await self._experiment(scene, rig, moves):
                 self._quiet = 0
                 return
-            await self.rig.apply(moves, history)
+            try:
+                await self.rig.apply(moves, history)
+            except CameraError:
+                if moves.camera is None:
+                    raise
+                # Refused (not offered, read-only, a slow readback): from the next tick decide asks for it by hand.
+                history.refused[moves.camera.setting] = moves.camera.value
+                self._quiet = 0
+                return
             if moves.light is not None:
                 self._light_ok()
         except LightError as err:
-            await self._light_failed(err)
+            self._light_failed(err)
             self._quiet = 0
             self._show(self.state.get("step", "balance"), *self._light_problem, screen=self._screen(moves))
             return
         was_ready = self.state.get("step") == "ready"
         self._quiet = self._quiet + 1 if moves == Moves() else 0
         ready = self._quiet >= 2 and self._lights["face"] == "green" and self._lights["window"] != "red"
-        if moves.camera is not None or not self._card_right:
+        if moves.camera is not None or asked_by_hand or not self._card_right:
             step = "camera"
         elif not light_only and not self._key_ok():
             step = "place_key"
@@ -352,9 +397,11 @@ class Director:
         """The checks decide cannot make itself; True when one ran, so this tick's frame is stale."""
 
         history = self.history
-        if not scene.face or moves.camera is not None:
+        if not scene.face or moves.camera is not None or by_hand(moves.ask):
             return False
         if history.key_check is None:
+            if await self._recording_now():
+                return True
             # The card is right: the key goes on at a working level, so a dim key is not taken for none.
             await self.rig.key.set_white(self.goal.kelvin, self.plan.key_percent or WORKING_PERCENT, rig.tint)
             await self.rig.key.set_power(True)
@@ -368,7 +415,8 @@ class Director:
             level0, balance0 = self._mark
             moved = abs(meter.stops_off(level0, scene.level, self.profile)) > MOVED_STOPS
             if moved or abs(balance - balance0) > MOVED_STOPS:
-                await self._check_key(scene)
+                if not await self._recording_now():
+                    await self._check_key(scene)
                 return True
             return False
         if history.catchlight in ("raise", "lower"):
@@ -377,12 +425,20 @@ class Director:
             if self._mark is None:
                 self._mark = (scene.level, 0.0)
                 return False
+            if await self._recording_now():
+                return True
             verdict = await asyncio.to_thread(meter.catchlight, scene.frame, history.key_check.off, self.profile)
             if verdict != history.catchlight:
                 history.catchlight = verdict  # ok, unreadable, or now the other way
                 self._mark = None
                 return True
         return False
+
+    async def _recording_now(self) -> bool:
+        """A fresh look before an experiment: the tick read the settings before its frame (about 0.8 s on
+        the camera), and a key check flashing the key must never land in the first second of a take."""
+
+        return bool((await self.rig.camera.settings()).get("recording"))
 
     async def _check_key(self, scene: Scene) -> None:
         self._mark = None
@@ -403,7 +459,7 @@ class Director:
         if not scene.face:
             self.history.snapshot = None  # taken when the face is back: a take holds a face, not a wall
         self._takes += 1
-        self._take = Take(self._takes, now, scene.camera.get("meter"), now)
+        self._take = Take(self._takes, now, scene.camera.get("meter"), now, exposure=_exposure(scene.camera))
         self.mode = "take"
         self._mark = None
         self._quiet = 0
@@ -414,29 +470,40 @@ class Director:
         if history.snapshot is None and scene.face:
             start_take(scene, history)
             take.meter = scene.camera.get("meter")
+            take.exposure = _exposure(scene.camera)
         level = history.snapshot[0] if history.snapshot is not None else self.goal.face_level
         self._judge(scene.face, scene.level, scene.window, level)
         moves = decide(scene, rig, self.goal, "take", history, now)
         history.last_tick = now
         lights = self._lights
-        take.tick(now, scene.camera.get("meter"), lights["face"] == "green", lights["window"] == "red", moves.held)
+        green, red = lights["face"] == "green", lights["window"] == "red"
+        take.tick(now, scene.camera.get("meter"), green, red, moves.held, _exposure(scene.camera))
         applied = moves if self.camera_moves else dataclasses.replace(moves, camera=None)
-        if applied.camera is not None:
-            take.camera_steps += 1
+        stepped = history.last_camera_step
+        held = moves.held
         try:
             await self.rig.apply(applied, history)
             if applied.light is not None:
                 self._light_ok()
+        except CameraError:
+            if applied.camera is None:
+                raise
+            # Refused: the light carries on and the camera is left alone for the rest of the take.
+            held = history.camera_refused = f"camera refused {canonical(applied.camera.setting, applied.camera.value)}"
+            take.held.setdefault(held, 0.0)
         except LightError as err:
             take.light_errors += 1
-            await self._light_failed(err)
+            self._light_failed(err)
+        if history.last_camera_step != stepped:
+            take.camera_steps += 1
         detail = self._light_problem[0] if self._light_problem else None
-        if moves.held is not None:
-            detail = capital(moves.held)
+        if held is not None:
+            detail = capital(held)
         self._show("take", "Recording", detail, screen="take")
 
-    async def _end_take(self, scene: Scene, now: float) -> None:
+    def _end_take(self, scene: Scene, now: float) -> None:
         self._take.meter_now = scene.camera.get("meter")
+        self._take.exposure_now = _exposure(scene.camera)
         self._take.last = now
         self.last_report = self._finish_take()
         self.mode = "setup"
@@ -444,7 +511,16 @@ class Director:
         self._quiet = 0
         self._showing_report = True
         self._show("ready", f"Take {self.last_report['take']} done", None, screen="report")
-        await self.texts.send("report", self.last_report["text"])
+        self._text("report", self.last_report["text"])
+
+    def _close_take(self) -> dict[str, Any] | None:
+        """The run is ending with a take open: report it now, with no await a cancel could cut short."""
+
+        if self._take is None:
+            return None
+        self.last_report = self._finish_take()
+        self._text("report", self.last_report["text"])
+        return self.last_report
 
     def _finish_take(self) -> dict[str, Any]:
         report = self._take.report(self._take.last, self.history.hands_off)
@@ -495,48 +571,46 @@ class Director:
             self.state = state
             self.publish(state)
 
-    async def _warn_camera(self, camera: dict[str, Any]) -> None:
-        battery = camera.get("battery")
-        await self._warn("battery", battery is not None and battery <= LOW_BATTERY, f"The camera battery is at {battery}%.")
-        await self._warn("overheat", camera.get("overheat") is True, "The camera is overheating and may stop recording.")
-        await self._warn("cards", camera.get("cards_ok") is False, "The camera has a problem with a memory card.")
+    def _text(self, kind: str, body: str) -> None:
+        send_later(self.texts, kind, body, self._sending)
 
-    async def _warn(self, kind: str, on: bool, body: str) -> None:
+    def _warn_camera(self, camera: dict[str, Any]) -> None:
+        battery = camera.get("battery")
+        self._warn("battery", battery is not None and battery <= LOW_BATTERY, f"The camera battery is at {battery}%.")
+        self._warn("overheat", camera.get("overheat") is True, "The camera is overheating and may stop recording.")
+        self._warn("cards", camera.get("cards_ok") is False, "The camera has a problem with a memory card.")
+
+    def _warn(self, kind: str, on: bool, body: str) -> None:
         """Text once when a condition starts; again only after it has cleared."""
 
         if not on:
             self._warned.discard(kind)
         elif kind not in self._warned:
             self._warned.add(kind)
-            await self.texts.send(kind, body)
+            self._text(kind, body)
 
-    async def _light_failed(self, err: LightError) -> None:
+    def _light_failed(self, err: LightError) -> None:
         if isinstance(err, LightUnreachable):
             self._light_problem = RETRYING
             body = "The light isn't answering. If the amaran or Sidus Link app is open on your phone, close it."
         else:
             self._light_problem = ("A light stopped answering", str(err))
             body = f"The light stopped answering: {err}"
-        await self._warn("light", True, body + " The director keeps trying.")
+        self._warn("light", True, body + " The director keeps trying.")
 
     def _light_ok(self) -> None:
         self._light_problem = None
         self._warned.discard("light")
 
-    async def _fail(self, instruction: str, detail: str | None) -> None:
+    def _fail(self, instruction: str, detail: str | None) -> None:
         self._show("stopped", instruction, detail, screen="coach")
-        await self.texts.send("stopped", f"The shot coach stopped. {instruction}: {detail}" if detail else instruction)
+        self._text("stopped", f"The shot coach stopped. {instruction}: {detail}" if detail else instruction)
 
     def _save_key_output(self, scene: Scene, rig: RigState) -> None:
         """Remember what the key does at full from where it is, for the next plan's key percent."""
 
-        camera, brightness = scene.camera, rig.brightness
-        if not scene.face or not brightness:
-            return
-        try:
-            # Readback comes in several forms ("ISO 800", '1/60"', "6.3"); exposure_of wants plain numbers.
-            exposure = exposure_of(*(canonical(s, camera[s]) for s in ("iso", "shutter", "aperture")))
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        brightness, exposure = rig.brightness, _exposure(scene.camera)
+        if not scene.face or not brightness or exposure is None:
             return
         stops = meter.stops_off(scene.level, self.goal.face_level, self.profile)
         self.settings.key_output = {

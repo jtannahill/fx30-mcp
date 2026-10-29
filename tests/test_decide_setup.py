@@ -267,3 +267,56 @@ def test_readback_in_other_forms_matches_the_card():
     plain = go().camera
     worded = {**CAMERA, "iso": "ISO 800", "shutter": '1/60"', "aperture": "4"}
     assert go(scene=make_scene(camera=worded), rig=make_rig(camera=worded)).camera == plain
+
+
+# A refused camera write: asked for by hand until the camera reads it.
+
+BIG_WINDOW = meter.Window(level=0.95, clipped=0.1, box=(0.0, 0.0, 0.2, 0.2), side="left", blue=0.0)
+
+
+def test_a_refused_card_value_is_asked_for_by_hand():
+    camera = {**CAMERA, "aperture": "f/11"}
+    history = placed()
+    history.refused = {"aperture": "f/16"}
+    moves = go(scene=make_scene(window=BIG_WINDOW, camera=camera), rig=make_rig(camera=camera), history=history)
+    assert moves == Moves(ask=Ask("Set f/16 on the camera", "Aperture"))
+    assert history.refused == {"aperture": "f/16"}
+
+
+def test_the_ask_clears_once_the_camera_reads_the_value():
+    camera = {**CAMERA, "aperture": "f/16"}
+    history = placed()
+    history.refused = {"aperture": "f/16"}
+    moves = go(scene=make_scene(window=BIG_WINDOW, camera=camera), rig=make_rig(camera=camera), history=history)
+    assert moves.ask is None and (moves.camera is None or moves.camera.setting != "aperture")
+    assert history.refused == {}
+
+
+def test_a_value_other_than_the_refused_one_is_still_written():
+    camera = {**CAMERA, "aperture": "f/11"}
+    history = placed()
+    history.refused = {"aperture": "f/22"}
+    moves = go(scene=make_scene(window=BIG_WINDOW, camera=camera), rig=make_rig(camera=camera), history=history)
+    assert moves.camera == CameraMove("aperture", "f/16")
+
+
+@pytest.mark.parametrize(
+    "camera, refused, ask",
+    [
+        ({"exposure_mode": "Movie F Mode"}, {"exposure_mode": "M"}, Ask("Set M on the camera", "Exposure mode")),
+        ({"kelvin": "5000"}, {"kelvin": "5600"}, Ask("Set 5600K on the camera", "White balance")),
+        ({"live_view_effect": False}, {"live_view_effect": "On"}, Ask("Set On on the camera", "Live view effect")),
+    ],
+)
+def test_other_refused_settings_are_asked_for_by_hand(camera, refused, ask):
+    camera = {**CAMERA, **camera}
+    history = placed()
+    history.refused = dict(refused)
+    assert go(rig=make_rig(camera=camera), history=history) == Moves(ask=ask)
+
+
+def test_a_refused_live_view_effect_clears_when_it_reads_on():
+    history = placed()
+    history.refused = {"live_view_effect": "On"}
+    go(history=history)
+    assert history.refused == {}

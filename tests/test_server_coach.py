@@ -294,6 +294,7 @@ def test_a_run_that_fails_while_stopping_still_frees_busy_and_the_page(server, m
 
     async def go():
         monkeypatch.setattr(server, "Director", Failing)
+        monkeypatch.setattr(server, "STOP_WAIT_SECONDS", 0.05)
         await server.coach_shot(modifier="bare")
         web = server._web
         await asyncio.sleep(0)
@@ -463,5 +464,58 @@ def test_an_unreachable_light_at_the_survey_names_the_phone_app(server, monkeypa
                            r"\(Bluetooth said: Found the light but could not connect \(\)\)$"):
             await server.coach_shot(modifier="bare")
         assert server._director is None and not server._busy.locked()
+
+    asyncio.run(go())
+
+
+async def _until(check, seconds=10.0):
+    for _ in range(int(seconds / 0.05)):
+        if check():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("timed out")
+
+
+def test_stop_coach_during_a_take_keeps_the_takes_report(server, texts):
+    async def go():
+        await server.coach_shot(modifier="bare")
+        director = server._director
+        await server.start_recording()
+        await _until(lambda: director.status()["mode"] == "take")
+        assert await server.stop_coach() == "coach stopped"
+        assert director.last_report is not None and director.last_report["take"] == 1
+        assert ("report", director.last_report["text"]) in texts.sent
+        await server.stop_recording()
+
+    asyncio.run(go())
+
+
+def test_a_slow_link_text_does_not_hold_up_coach_shot(server, monkeypatch):
+    class Stuck:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, kind, body):
+            self.sent.append((kind, body))
+            await asyncio.Event().wait()
+
+    stuck = Stuck()
+    monkeypatch.setattr(server, "texts_for_server", lambda: stuck)
+
+    async def go():
+        try:
+            await asyncio.wait_for(server.coach_shot(modifier="bare"), 5)
+            assert stuck.sent[0][0] == "link"
+        finally:
+            await server.stop_coach()
+
+    asyncio.run(go())
+
+
+def test_balance_shot_while_busy_names_both(server):
+    async def go():
+        async with server._busy:
+            with pytest.raises(ToolError, match="^a balance or the shot coach is already running$"):
+                await server.balance_shot()
 
     asyncio.run(go())

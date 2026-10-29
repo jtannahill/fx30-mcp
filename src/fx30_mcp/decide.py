@@ -2,8 +2,9 @@
 
 decide() looks at one Scene, the rig as last written, the goal and the history, and returns
 Moves: at most one light move, one camera move and one thing to ask of the person. It is pure
-apart from updating history.gain and history.last_stops in setup, and history.hands_off and
-history.last_tint_step in a take. Setup mode brings the shot to Ready. Balance mode is setup for the
+apart from updating history.gain, history.last_stops and history.refused in setup, and
+history.hands_off and history.last_tint_step in a take. Setup mode brings the shot to Ready; a value
+the camera refused to take over USB is asked for by hand until the camera reads it. Balance mode is setup for the
 light alone: no camera move and no key placement, for balance_shot. Take mode holds what recording
 started with (start_take), slowly enough that a viewer never sees a change, and never asks.
 The Rig applies the moves and the Director owns the history.
@@ -67,6 +68,16 @@ CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let t
 DARKEST = ("The camera can't darken this window any further", "ND film or a sheer curtain on the glass would.")
 NO_FACE = ("Sit in the shot", "The coach needs your face in the frame to plan.")
 CONNECTING = ("Connecting to the light", "This can take up to two minutes.")
+# The setting each camera move writes, as the page names it when the owner must set it by hand.
+LABELS = {
+    "aperture": "Aperture",
+    "shutter": "Shutter",
+    "iso": "ISO",
+    "kelvin": "White balance",
+    "exposure_mode": "Exposure mode",
+    "live_view_effect": "Live view effect",
+}
+BY_HAND = " on the camera"
 UNREACHABLE = (
     "The light isn't answering",
     "If the amaran or Sidus Link app is open on your phone, close it or turn off the phone's Bluetooth, "
@@ -134,6 +145,8 @@ class History:  # owned by the Director, read by decide
     snapshot_meter: float | None = None  # take: the camera's meter at record start
     commanded: dict[str, str] = field(default_factory=dict)  # camera values the director last wrote
     hands_off: bool = False  # owner changed the camera by hand this take
+    refused: dict[str, str] = field(default_factory=dict)  # setup: setting -> the value the camera refused
+    camera_refused: str | None = None  # take: why camera steps are off for the rest of it ("camera refused f/22")
     last_camera_step: float = -math.inf
     last_tint_step: float = -math.inf
     last_tick: float | None = None
@@ -186,6 +199,7 @@ def start_take(scene: Scene, history: History) -> None:
     history.snapshot = (scene.level, scene.cb, scene.cr)
     history.snapshot_meter = scene.camera.get("meter")
     history.hands_off = False
+    history.camera_refused = None
     # A take reads the gain but never learns it: capped at 1/6 stop a second it can hardly overshoot,
     # so a sign flip there is the subject moving. Each take, and the setup after it, starts fresh.
     history.gain = 1.0
@@ -220,6 +234,35 @@ def _card_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
         if current is not None and current != wanted:
             return CameraMove(setting, getattr(card, setting))
     return None
+
+
+def _reads_as(setting: str, readback: Any, value: str) -> bool:
+    if setting == "live_view_effect":
+        return readback is True
+    return readback is not None and canonical(setting, readback) == canonical(setting, value)
+
+
+def _shown(move: CameraMove) -> str:
+    if move.setting == "kelvin":
+        return f"{move.value}K"
+    if move.setting in CARD_SETTINGS:
+        return canonical(move.setting, move.value)
+    return move.value
+
+
+def _write_or_ask(move: CameraMove, history: History) -> Moves:
+    """The camera move, or, when the camera refused this very value, an ask to set it by hand."""
+
+    refused = history.refused.get(move.setting)
+    if refused is not None and canonical(move.setting, refused) == canonical(move.setting, move.value):
+        return Moves(ask=Ask(f"Set {_shown(move)}{BY_HAND}", LABELS[move.setting]))
+    return Moves(camera=move)
+
+
+def by_hand(ask: Ask | None) -> bool:
+    """The ask is for a camera setting the camera would not take over USB."""
+
+    return ask is not None and ask.instruction.endswith(BY_HAND) and ask.detail in LABELS.values()
 
 
 def key_placed(check: KeyCheck, side: str) -> bool:
@@ -274,14 +317,17 @@ def _learn_gain(stops: float, history: History) -> None:
 def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only: bool = False) -> Moves:
     """Light only (balance mode) leaves the camera and the key's placement as they are."""
 
+    for setting, value in list(history.refused.items()):
+        if _reads_as(setting, rig.camera.get(setting), value):
+            del history.refused[setting]  # set by hand: the ask is done
     move = None if light_only else _camera_move(scene, rig, goal)
     if move is not None:
-        return Moves(camera=move)
+        return _write_or_ask(move, history)
     if not scene.face:
         return Moves(ask=Ask(*NO_FACE))
     move = None if light_only else _card_move(scene, rig, goal)
     if move is not None:
-        return Moves(camera=move)
+        return _write_or_ask(move, history)
     ask = None if light_only else _key_ask(goal, history)
     if ask is not None:
         return Moves(ask=ask)
@@ -439,6 +485,8 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
         what = "window clipping" if darker else "window too dark"
         if history.hands_off:
             held = "camera changed by hand"
+        elif history.camera_refused is not None:
+            held = history.camera_refused
         elif now - history.last_camera_step >= CAMERA_STEP_SECONDS:
             step, off_ladder = _next_step(scene, goal, darker)
             paired = new_brightness * 2 ** (STEP if darker else -STEP)
