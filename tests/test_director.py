@@ -8,7 +8,7 @@ from amaran_mcp.link import LinkError
 from fx30_mcp import config, meter
 from fx30_mcp.camera import CameraError
 from fx30_mcp.config import Settings
-from fx30_mcp.decide import CAMERA_STEP_SECONDS
+from fx30_mcp.decide import CAMERA_STEP_SECONDS, DARKEST
 from fx30_mcp.director import IDLE_END_SECONDS, Director
 from fx30_mcp.plan import exposure_of
 from fx30_mcp.report import Take, report_text
@@ -1099,16 +1099,16 @@ def test_it_does_not_jump():
 
 def test_a_window_that_keeps_clipping_is_darkened_until_ready():
     # Rec.709 judged truthfully, so a clipping window is red and Ready waits on it. A bright patch of sky,
-    # 5% of the window and 1.5 stops over the rest of it, clips at the card the window's median wants.
+    # 5% of the window and 3/4 stop over the rest of it, clips at the card the window's median wants.
     camera, key = sim(stops_at_full=2.5)
     camera.gamma = "Rec709"
-    camera.glint, camera.glint_stops = GLINT, 1.5
+    camera.glint, camera.glint_stops = GLINT, 0.75
     start = dict(camera.values)
     director, states, texts, clock = make(camera, key)
     go(director, clock, after_ready(director, lambda s: s > 5 and director.stop()), limit=120)
     assert ("ready", "Ready to record") in [(s["step"], s["instruction"]) for s in states]
     steps = [exposure_of(**start)] + [e for _t, e in exposures(camera, start)]
-    assert len(steps) >= 3 and all(b < a for a, b in zip(steps, steps[1:]))
+    assert len(steps) >= 2 and all(b < a for a, b in zip(steps, steps[1:]))
     ready = next(s for s in states if s["step"] == "ready")
     assert ready["lights"]["window"] != "red"
 
@@ -1129,3 +1129,58 @@ def test_a_stop_down_by_hand_after_ready_is_corrected():
     go(director, clock, after_ready(director, then))
     opened = [v for t, setting, v in camera.sets if t >= mark["hand"] and setting == "aperture"]
     assert opened and camera.values["aperture"] == SETTLED
+
+
+@pytest.mark.parametrize("profile, noise", [("rec709", 0.0), ("rec709", 0.3), ("slog3", 0.3)])
+def test_a_glint_nothing_can_tame_asks_for_nd_and_keeps_the_window_in_sight(monkeypatch, profile, noise):
+    # Sun off the glass on every frame, white however far the camera stops down. The card darkens only so far
+    # that the window is still found, then says what would help: never a silent stall, never a lost window.
+    lost = []
+    real = meter.find_window
+
+    def find_window(*args):
+        found = real(*args)
+        lost.append(found is None)
+        return found
+
+    monkeypatch.setattr(meter, "find_window", find_window)
+    camera, key = sim(stops_at_full=2.5)
+    settings = Settings(profile=profile)
+    if profile == "slog3":  # calibrated as sim() does, in slog3: 2.5 stops over at full
+        camera.profile, key.state.brightness = "slog3", 100
+        under = meter.stops_off(meter.read(camera.render(), SIM_FACE).lit, settings.target, "slog3")
+        camera.gain *= 2 ** (under + 2.5)
+        key.state.brightness = 30
+    camera.gamma = {"rec709": "Rec709", "slog3": "S-Log3"}[profile]
+    camera.glint, camera.noise = GLINT, noise
+    start = dict(camera.values)
+    director, states, texts, clock = make(camera, key, settings)
+    go(director, clock, lambda _t: None, limit=60)
+    shown = [(s["step"], s["instruction"]) for s in states]
+    assert ("ready", "Ready to record") in shown or any(i == DARKEST[0] for _step, i in shown)
+    assert not any(lost)
+    steps = [exposure_of(**start)] + [e for _t, e in exposures(camera, start)]
+    assert all(b < a for a, b in zip(steps, steps[1:]))
+
+
+@pytest.mark.parametrize("aperture", ["f/6.3", "f/10"])
+def test_setup_does_not_turn_back_from_off_its_aim(aperture):
+    # Setup starting off its aim (a third bright, a stop dark), the window noisy and glinting every 2 s: over many
+    # runs the exposure never turns back. Before glints obeyed the rule, seeds 7 and 16 opened up, then darkened.
+    for seed in range(20):
+        camera, key = sim()
+        camera.values["aperture"] = aperture
+        camera.noise, camera.rng = 0.3, random.Random(seed)
+        start = dict(camera.values)
+        director, states, texts, clock = make(camera, key)
+        mark = {"glint": 0.0}
+
+        def script(t: float) -> None:
+            if t - mark["glint"] >= 2:
+                mark["glint"] = t
+                camera.glint_frames = 1
+            if t > 25:
+                director.stop()
+
+        go(director, clock, script)
+        assert reversals(camera, start) == 0, f"seed {seed}"

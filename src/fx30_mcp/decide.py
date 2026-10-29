@@ -15,11 +15,15 @@ WINDOW_SMOOTH_SECONDS, so one noisy frame moves nothing and the director's own s
 changing. Setup aims it once at the middle of its band and then, like a take, moves only when it leaves
 the band. A clipped frame is only a floor, so it can only darken, and the exposure it clipped at is
 remembered: the camera never opens up to within CLIP_MARGIN of it until the light falls well below. A
-window that keeps clipping in setup darkens the card a third at a time until it stops, or asks for ND.
+window that keeps clipping in setup (its clip share, averaged, past WINDOW_CLIPPED) darkens the card a
+third at a time until it stops, but never past a floor fixed when that starts, CLIP_FLOOR_MARGIN above
+the mid grey under which the window is no longer found; there it asks for ND. A window too dark to be
+found is judged in setup from its average.
 And the owner's rule, that it does not jump: the director does not turn its own last move back (darker
 then brighter, or brighter then darker) unless the average has moved more than the band is wide since.
-Two things are exempt: a window that keeps clipping in setup, which only ever darkens, and a camera
-changed by hand since that move, which the director no longer counts as its own.
+Glints obey it. Exempt are a window that keeps clipping in setup, which only ever darkens, a camera
+changed by hand since that move, which the director no longer counts as its own, and a window lost
+darker than that floor, which may be opened up to find again.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from typing import Any
 from . import meter
 from .plan import (
     APERTURES,
+    CLIP,
     MIN_KEY_FT,
     SHUTTERS,
     UNEVEN_STOPS,
@@ -85,6 +90,9 @@ WINDOW_SMOOTH_SECONDS = 4.0  # the average's time constant; an unclipped average
 WINDOW_MAX_DT = 2.0  # seconds: a frame after a long gap (a key check) counts no more than this toward the average
 CLIP_MARGIN = 1 / 3  # stops: opening up stops this far short of an exposure the window clipped at
 CLIP_FORGET = 1.0  # stops the average must fall below where the window clipped before that is forgotten
+# Stops above mid grey (where meter.find_window stops counting a window) that darkening for a window that keeps
+# clipping stops short of: room for a frame a third of a stop dark, from an average a third high.
+CLIP_FLOOR_MARGIN = 2 / 3
 ROUNDING = 0.05  # stops: nominal values ("f/14", "1/125") are rounded
 MAX_CARD_CHANGES = 6  # setup: new cards aimed at before the card is held (a clipped window still darkens it)
 
@@ -181,6 +189,7 @@ class History:  # owned by the Director, read by decide
     clip_ceiling: float | None = None  # the lowest camera exposure the window was seen clipping at
     clip_scene: float | None = None  # the average when it last clipped
     clip_share: float = 0.0  # the share of the window at white, averaged: past WINDOW_CLIPPED it keeps clipping
+    clip_floor: float | None = None  # setup: the darkest exposure a window that keeps clipping may be taken to
     aimed: bool = False  # setup has aimed the window at the middle of its band from a settled average
     card: CameraCard | None = None  # setup: the card last aimed at
     card_from: tuple[str | None, ...] | None = None  # setup: what the camera read when it was aimed
@@ -254,7 +263,7 @@ def start_take(scene: Scene, history: History) -> None:
     history.meter_scene = None
     if history.snapshot_meter is not None and exposure is not None:
         history.meter_scene = history.snapshot_meter - exposure  # the meter rises with exposure: take it out
-    history.card, history.card_from, history.card_changes = None, None, 0
+    history.card, history.card_from, history.card_changes, history.clip_floor = None, None, 0, None
     history.hands_off = False
     history.camera_refused = None
     # A take reads the gain but never learns it: capped at 1/6 stop a second it can hardly overshoot,
@@ -272,7 +281,7 @@ def start_take(scene: Scene, history: History) -> None:
 def end_take(history: History) -> None:
     """Recording has stopped: setup may aim new cards again."""
 
-    history.card, history.card_from, history.card_changes = None, None, 0
+    history.card, history.card_from, history.card_changes, history.clip_floor = None, None, 0, None
 
 
 def _dt(history: History, now: float) -> float:
@@ -302,12 +311,10 @@ def _watch_window(window: meter.Window, profile: str, exposure: float, history: 
     # Once settled, a floor is folded in without starting over, so a glint never brings back "window settling".
     young = average is None or history.window_seconds < WINDOW_SMOOTH_SECONDS
     if clipped:
-        if average is None or reading > average:
+        raised = average is None or reading > average
+        if raised:
             history.window_scene, history.window_bound = reading, True
-        if young and history.window_scene == reading:
-            history.window_seconds = 0.0
-        else:
-            history.window_seconds += dt
+        history.window_seconds = 0.0 if young and raised else history.window_seconds + dt
     elif average is None or (young and history.window_bound and reading > average):
         history.window_scene, history.window_seconds, history.window_bound = reading, 0.0, False
     else:
@@ -318,8 +325,12 @@ def _watch_window(window: meter.Window, profile: str, exposure: float, history: 
         history.clip_ceiling = exposure if history.clip_ceiling is None else min(history.clip_ceiling, exposure)
         history.clip_scene = history.window_scene
     elif history.clip_ceiling is not None and history.window_scene < history.clip_scene - CLIP_FORGET:
-        history.clip_ceiling = history.clip_scene = None  # the light changed: a cloud, the evening
+        _forget_clip(history)  # the light changed: a cloud, the evening
     return clipped
+
+
+def _forget_clip(history: History) -> None:
+    history.clip_ceiling = history.clip_scene = history.clip_floor = None
 
 
 def _too_dark_to_see(history: History, profile: str, exposure: float) -> bool:
@@ -418,11 +429,18 @@ def _card_move(
     readback = {s: canonical(s, rig.camera[s]) for s in CARD_SETTINGS if rig.camera.get(s) is not None}
     current = {**rig.camera, **readback}
     exposure = camera_exposure(rig.camera)
-    if scene.window is None and (exposure is None or not _too_dark_to_see(history, goal.profile, exposure)):
+    found = scene.window is not None
+    floor = history.clip_floor
+    if not found and exposure is not None and floor is not None and exposure < floor - ROUNDING:
+        # Lost, darker than a clipping window is ever taken (stopped down by hand, or the light fell): forget the
+        # clip and the last move, so the card may open up and find it again.
+        _forget_clip(history)
+        history.last_move = 0
+    if not found and (exposure is None or not _too_dark_to_see(history, goal.profile, exposure)):
         return _toward(camera_card(current, 0.0, goal.frame_rate, goal.widest, False), rig), None, None
     if exposure is None:
         return None, None, None
-    clipped = scene.window is not None and _watch_window(scene.window, goal.profile, exposure, history, now)
+    clipped = found and _watch_window(scene.window, goal.profile, exposure, history, now)
     # A card still being written is walked to the end, one setting per tick, and judged as if written: a
     # shutter brought back to base can make the first write darker than the whole card. A setting that is
     # neither the card's nor what the camera read before it was set by hand: the card is dropped.
@@ -436,17 +454,31 @@ def _card_move(
     if walking is None and history.last_move and moved_to is not None and abs(exposure - moved_to) > ROUNDING:
         history.last_move = 0  # changed by hand since the director's last move: not its own to turn back
     wanted, half = _window_wanted(history, goal, goal.face_level)
-    if clipped:
-        target = min(wanted, exposure)  # a clipped window is above its band: never brighter
-        if history.clip_share > WINDOW_CLIPPED:
-            target = min(target, exposure - CLIP_MARGIN)  # it keeps clipping: a third below where it clipped
-        elif target > basis - STOP_TOLERANCE:
-            return walking, None, None  # a glint, no darker than the average says: nothing new to aim at
+    floored = False
+    if clipped and history.clip_share > WINDOW_CLIPPED:
+        # It keeps clipping: a third below where it clipped, whichever way the card last moved (it only ever
+        # darkens, so it cannot loop), but never so dark that the window sinks out of sight. That floor is fixed
+        # when the darkening starts, from the average then; a window white to its middle needs none (it cannot
+        # be lost, and its average is only a floor), so it is fixed once the middle reads.
+        if scene.window.level >= CLIP[goal.profile]:
+            history.clip_floor = None
+        elif history.clip_floor is None:
+            mid_grey = math.log2(meter.to_linear(0.5, goal.profile))
+            history.clip_floor = mid_grey + CLIP_FLOOR_MARGIN - history.window_scene
+        target = min(wanted, basis, exposure - CLIP_MARGIN)
+        if history.clip_floor is not None and target < history.clip_floor:
+            target, floored = history.clip_floor, True
         if basis <= target + ROUNDING:
-            return walking, None, None  # the card being written already goes there
+            return walking, Ask(*DARKEST) if floored else None, None  # the card already goes as dark as it may
+    elif clipped:
+        if wanted > basis - STOP_TOLERANCE:
+            return walking, None, None  # a glint, no darker than the average says: nothing new to aim at
+        target = wanted  # darker than the card, so never brighter
+        if _turns_back(target - basis, history, 2 * half):
+            return walking, None, None
     else:
-        if history.window_seconds < WINDOW_SMOOTH_SECONDS:
-            return walking, None, "window settling"
+        if found and history.window_seconds < WINDOW_SMOOTH_SECONDS:
+            return walking, None, "window settling"  # a window not found cannot settle: it is judged from memory
         if history.aimed and abs(basis - wanted) <= half:
             return walking, None, None  # inside its band: leave the card alone
         history.aimed = True  # aim once at the middle; from here on only leaving the band moves it
@@ -454,11 +486,13 @@ def _card_move(
         if _turns_back(target - basis, history, 2 * half):
             return walking, None, None
     stops = target - exposure
-    if stops > 0 and history.clip_ceiling is not None:
+    if floored:
+        stops = math.ceil(3 * (stops - ROUNDING)) / 3  # whole thirds, so the card's rounding cannot pass the floor
+    elif stops > 0 and history.clip_ceiling is not None:
         stops = math.floor(3 * (stops + ROUNDING)) / 3  # whole thirds, so the card's rounding cannot pass the cap
     card = camera_card(current, stops, goal.frame_rate, goal.widest, True)
-    if clipped and _card_exposure(card) > exposure - ROUNDING:
-        return walking, Ask(*DARKEST), None  # the darkest card already: only ND or a curtain can help
+    if clipped and _card_exposure(card) > min(basis, exposure) - ROUNDING:
+        return walking, Ask(*DARKEST), None  # no darker card: only ND or a curtain can help
     if _card_values(card) != _card_values(history.card or current):
         # Past MAX_CARD_CHANGES the card holds; a clipped window only ever darkens it, so it cannot loop.
         if history.card_changes < MAX_CARD_CHANGES or clipped:

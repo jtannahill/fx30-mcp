@@ -6,6 +6,7 @@ import pytest
 from fx30_mcp import meter
 from fx30_mcp.decide import (
     CANT_HOLD,
+    CLIP_FLOOR_MARGIN,
     DARKEST,
     MAX_CARD_CHANGES,
     NO_FACE,
@@ -23,7 +24,7 @@ from fx30_mcp.decide import (
     key_placed,
     start_take,
 )
-from fx30_mcp.plan import Geometry, closer, fmt_ft, window_band
+from fx30_mcp.plan import Geometry, closer, fmt_ft, window_band, window_scene
 from fx30_mcp.scene import Scene
 from fx30_mcp.survey import KeyCheck
 
@@ -450,8 +451,9 @@ def test_the_card_does_not_turn_back_unless_the_light_moved_more_than_the_band()
 def test_a_clipped_window_never_brightens_the_card():
     history = watching(AIM - 1.0, aimed=False)  # a dark average: the card would open up
     assert tick(history, AIM - 1.0, clipped=0.05).camera is None  # a glint: nothing
-    move = tick(watching(AIM - 1.0, aimed=False), AIM - 1.0, clipped=0.3).camera  # a sixth white: it keeps clipping
-    assert move.setting == "aperture" and float(move.value.lstrip("f/")) > 4  # darker, never brighter
+    # A third white keeps clipping, but this window sits just over mid grey: darker would lose it, so it asks.
+    moves = tick(watching(AIM - 1.0, aimed=False), AIM - 1.0, clipped=0.3)
+    assert moves.camera is None and moves.ask == Ask(*DARKEST)
 
 
 def test_setup_holds_the_card_after_max_card_changes():
@@ -474,23 +476,25 @@ def test_setup_holds_the_card_after_max_card_changes():
 
 
 
-def test_a_window_that_keeps_clipping_darkens_the_card_until_it_stops():
-    # More than 2% of the window clips frame after frame while its median sits mid-band (a bright patch of sky):
-    # the card darkens a third at a time, whichever way it last moved, until the window stops clipping.
-    history = watching(AIM)
-    history.last_move, history.last_move_scene = 1, AIM
+def test_a_window_that_keeps_clipping_darkens_the_card_but_never_out_of_sight():
+    # More than 2% of the window clips frame after frame (sun on the glass): the card darkens, whichever way it
+    # last moved, but never so far that the window would sink to within CLIP_FLOOR_MARGIN of mid grey, where it
+    # is no longer found. There it asks for ND instead.
+    history = watching(AIM + 1.0)
+    history.last_move, history.last_move_scene, history.last_move_exposure = 1, AIM + 1.0, camera_exposure(CAMERA)
+    floor = math.log2(meter.to_linear(0.5, "rec709")) + CLIP_FLOOR_MARGIN - (AIM + 1.0)
     camera, moves = dict(CAMERA), []
     for _ in range(12):
-        move = tick(history, AIM, camera, clipped=0.05).camera
-        moves.append(move)
-        camera = follow(camera, move)
-    darker = [m for m in moves if m is not None]
-    assert len(darker) >= 3
-    assert camera_exposure(camera) <= camera_exposure(CAMERA) - 1.0
+        moves.append(tick(history, AIM + 1.0, camera, clipped=0.3))
+        camera = follow(camera, moves[-1].camera)
+    steps = [camera_exposure(CAMERA)] + [camera_exposure(follow(CAMERA, m.camera)) for m in moves if m.camera]
+    assert len(steps) >= 3 and all(b < a for a, b in zip(steps, steps[1:]))
+    assert floor - 0.05 <= camera_exposure(camera) < camera_exposure(CAMERA) - 1.0
+    assert moves[-1].camera is None and moves[-1].ask == Ask(*DARKEST)
     # The window stops clipping: the card stays where it got to.
     held = dict(camera)
     for _ in range(10):
-        camera = follow(camera, tick(history, AIM, camera).camera)
+        camera = follow(camera, tick(history, AIM + 1.0, camera).camera)
     assert camera == held
 
 
@@ -507,14 +511,16 @@ def test_at_the_darkest_card_a_clipping_window_asks_for_nd():
     assert moves[-1].ask == Ask(*DARKEST)
 
 
-def test_a_card_needing_two_writes_is_written_to_the_end():
+@pytest.mark.parametrize("glint", [0.0, 0.05])
+def test_a_card_needing_two_writes_is_written_to_the_end(glint):
     # From f/8 at 1/125 the card for a window 0.7 stop over its middle is f/14 at 1/60: the aperture first (darker
-    # than the card means) and then the shutter (brighter). Judged by the card, not the half-written camera.
+    # than the card means) and then the shutter (brighter). Judged by the card, not the half-written camera,
+    # even when a glint clips part of the window between the two writes.
     start = {**CAMERA, "aperture": "f/8", "shutter": "1/125"}
     scene = AIM + 0.7 - (camera_exposure(start) - camera_exposure(CAMERA))
     history, camera = watching(scene), dict(start)
-    for _ in range(6):
-        camera = follow(camera, tick(history, scene, camera).camera)
+    for n in range(6):
+        camera = follow(camera, tick(history, scene, camera, clipped=glint if n == 1 else 0.0).camera)
     assert (camera["aperture"], camera["shutter"]) == ("f/14", "1/60")
     assert camera_exposure(camera) == pytest.approx(camera_exposure(start) - 0.7, abs=1 / 6)
 
@@ -547,3 +553,21 @@ def test_a_window_too_dark_to_find_is_judged_from_memory():
     assert move.camera.setting == "aperture" and float(move.camera.value.lstrip("f/")) < 11
     gone = decide(make_scene(window=None), make_rig(), make_goal(), "setup", watching(AIM + 1.0), 1.0)
     assert gone.camera is None
+
+
+
+def test_a_glint_does_not_turn_the_card_back():
+    # The card last opened up. A glint lifts the average 0.4 stop, less than the band is wide: no darker card.
+    history = watching(AIM)
+    history.last_move, history.last_move_scene, history.last_move_exposure = 1, AIM, camera_exposure(CAMERA)
+    assert tick(history, AIM + 0.4, clipped=0.05).camera is None
+
+
+def test_a_young_average_keeps_counting_through_a_clipped_frame_that_does_not_raise_it():
+    history = placed()
+    history.last_tick = 0.0
+    frame = window_at(AIM, clipped=0.05)
+    history.window_scene = window_scene(frame.level, "rec709", camera_exposure(CAMERA))  # exactly this reading
+    history.window_seconds = 2.0
+    tick(history, AIM, clipped=0.05)
+    assert history.window_seconds == pytest.approx(3.0)
