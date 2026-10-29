@@ -16,6 +16,7 @@ from .camera import CameraBase
 
 Sleep = Callable[[float], Awaitable[None]]
 LIT_SHARE = 0.1  # the key must add at least this share of the off level to count
+LIT_PERCENT = 50  # the key's least level for finding a face too dark to find unlit
 
 
 @dataclass
@@ -66,9 +67,36 @@ async def survey(
         for light, was_on in previous:
             await light.set_power(was_on)
     reading = await asyncio.to_thread(meter.read, frame)
-    yaw = await asyncio.to_thread(meter.face_yaw, frame)
+    turned = frame
+    if not reading.face and key is not None:
+        # Stopped down for a bright window, the unlit face can be too dark to find
+        # (f/16 at midday, Oct 29). Find it with the key on; meter the unlit frame there.
+        lit = await _lit_frame(camera, key, settle, sleep)
+        box = await asyncio.to_thread(meter.find_face, lit)
+        if box is not None:
+            reading = await asyncio.to_thread(meter.read, frame, box)
+            turned = lit
+    yaw = await asyncio.to_thread(meter.face_yaw, turned)
     window = await asyncio.to_thread(meter.find_window, frame, reading.box, profile)
     return Survey(reading, yaw, reading.sides, window, settings, info, frame)
+
+
+async def _lit_frame(camera: CameraBase, key: Any, settle: float, sleep: Sleep) -> bytes:
+    """One frame with the key on at LIT_PERCENT or more; then the key goes back as it was."""
+
+    was_on, level = key.state.power, key.state.brightness
+    raised = level is None or level < LIT_PERCENT
+    try:
+        await key.set_power(True)
+        if raised:
+            await key.set_brightness(LIT_PERCENT)
+        await sleep(settle)
+        return await camera.frame()
+    finally:
+        if raised and level is not None:
+            await key.set_brightness(level)
+        if was_on is not None:
+            await key.set_power(was_on)
 
 
 async def key_check(
