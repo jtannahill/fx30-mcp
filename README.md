@@ -1,5 +1,11 @@
 # fx30-mcp
 
+Controlling a camera and its lights through each manufacturer's own app is a
+burden, no longer a luxury: one app to pair the light, another to remote the
+camera, and you in front of the lens tapping between them. fx30-mcp is an attempt
+to fold that gear into an office that already runs on voice and prompts, so the
+shot is set up the way everything else is: by asking for it.
+
 Set up and watch a one-person talking-head shot with a Sony FX30 and an amaran
 light, from Claude Code. It drives the camera over USB, reads its live view, and
 sets the camera and the light for you, then keeps your face lit through every
