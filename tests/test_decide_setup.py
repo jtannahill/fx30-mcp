@@ -1,11 +1,14 @@
 import dataclasses
+import math
 
 import pytest
 
 from fx30_mcp import meter
 from fx30_mcp.decide import (
     CANT_HOLD,
+    MAX_CARD_CHANGES,
     NO_FACE,
+    WINDOW_SMOOTH_SECONDS,
     Ask,
     CameraMove,
     Goal,
@@ -13,10 +16,13 @@ from fx30_mcp.decide import (
     LightMove,
     Moves,
     RigState,
+    camera_exposure,
     decide,
+    end_take,
     key_placed,
+    start_take,
 )
-from fx30_mcp.plan import Geometry, closer, fmt_ft
+from fx30_mcp.plan import Geometry, closer, fmt_ft, window_band
 from fx30_mcp.scene import Scene
 from fx30_mcp.survey import KeyCheck
 
@@ -94,7 +100,8 @@ def test_window_too_bright_steps_the_card():
     camera = {**CAMERA, "aperture": "f/11"}
     window = meter.Window(level=0.95, clipped=0.1, box=(0.0, 0.0, 0.2, 0.2), side="left", blue=0.0)
     moves = go(scene=make_scene(window=window, camera=camera), rig=make_rig(camera=camera))
-    assert moves.camera == CameraMove("aperture", "f/16")
+    # Clipped, its level is a floor: aimed at the middle of the band from there, 0.78 stop darker.
+    assert moves.camera == CameraMove("aperture", "f/14")
 
 
 def test_face_one_stop_under_doubles_the_key():
@@ -277,10 +284,10 @@ BIG_WINDOW = meter.Window(level=0.95, clipped=0.1, box=(0.0, 0.0, 0.2, 0.2), sid
 def test_a_refused_card_value_is_asked_for_by_hand():
     camera = {**CAMERA, "aperture": "f/11"}
     history = placed()
-    history.refused = {"aperture": "f/16"}
+    history.refused = {"aperture": "f/14"}
     moves = go(scene=make_scene(window=BIG_WINDOW, camera=camera), rig=make_rig(camera=camera), history=history)
-    assert moves == Moves(ask=Ask("Set f/16 on the camera", "Aperture"))
-    assert history.refused == {"aperture": "f/16"}
+    assert moves == Moves(ask=Ask("Set f/14 on the camera", "Aperture"))
+    assert history.refused == {"aperture": "f/14"}
 
 
 def test_the_ask_clears_once_the_camera_reads_the_value():
@@ -297,7 +304,7 @@ def test_a_value_other_than_the_refused_one_is_still_written():
     history = placed()
     history.refused = {"aperture": "f/22"}
     moves = go(scene=make_scene(window=BIG_WINDOW, camera=camera), rig=make_rig(camera=camera), history=history)
-    assert moves.camera == CameraMove("aperture", "f/16")
+    assert moves.camera == CameraMove("aperture", "f/14")
 
 
 @pytest.mark.parametrize(
@@ -320,3 +327,144 @@ def test_a_refused_live_view_effect_clears_when_it_reads_on():
     history.refused = {"live_view_effect": "On"}
     go(history=history)
     assert history.refused == {}
+
+
+# The window: its brightness with the camera taken out, smoothed, aimed at the middle of its band once,
+# then left alone inside the band. A clipped frame is only a floor, and where it clipped is remembered.
+
+LO, HI = window_band(FACE_LEVEL, "rec709", [0.5, 2.0])
+# The window's brightness, camera taken out (plan.window_scene), that CAMERA puts at the middle of the band.
+AIM = math.log2(meter.to_linear(FACE_LEVEL, "rec709")) + (LO + HI) / 2 - camera_exposure(CAMERA)
+
+
+def window_at(scene, camera=CAMERA, clipped=0.0):
+    """The window a camera set as camera shows for a scene value."""
+    level = meter.from_linear(2 ** (scene + camera_exposure(camera)), "rec709")
+    return meter.Window(level=level, clipped=clipped, box=(0.0, 0.0, 0.2, 0.2), side="left", blue=0.0)
+
+
+# Rec.709 at its default face target, where the band is its narrowest: 2/3 stop.
+DEFAULT_709 = dataclasses.replace(make_goal(), face_level=0.60, window_range=[2.0, 4.0])
+LO_709, HI_709 = window_band(0.60, "rec709", [2.0, 4.0])
+AIM_709 = math.log2(meter.to_linear(0.60, "rec709")) + (LO_709 + HI_709) / 2 - camera_exposure(CAMERA)
+
+
+def watching(scene=AIM, aimed=True):
+    """A placed key, and a window average that has watched scene long enough to act on."""
+    history = placed()
+    history.window_scene, history.window_seconds, history.aimed = scene, WINDOW_SMOOTH_SECONDS, aimed
+    history.last_tick = 0.0
+    return history
+
+
+def tick(history, scene, camera=CAMERA, clipped=0.0, goal=None):
+    """One setup tick a second after the last, as the director runs them."""
+    now = (history.last_tick or 0.0) + 1.0
+    frame = make_scene(window=window_at(scene, camera, clipped), camera=camera)
+    moves = decide(frame, make_rig(camera=camera), goal or make_goal(), "setup", history, now)
+    history.last_tick = now
+    return moves
+
+
+def follow(camera, move):
+    """The camera as it reads after a card move."""
+    return camera if move is None else {**camera, move.setting: move.value}
+
+
+def test_the_window_average_takes_the_camera_out():
+    history = watching(AIM + 0.2)
+    darker = {**CAMERA, "aperture": "f/5.6"}
+    for camera in (CAMERA, darker, CAMERA, darker):
+        tick(history, AIM + 0.2, camera)
+        assert history.window_scene == pytest.approx(AIM + 0.2, abs=0.01)
+
+
+def test_the_first_window_reading_does_not_move_the_card():
+    history = placed()
+    history.last_tick = 0.0
+    assert all(tick(history, AIM + 1.0).camera is None for _ in range(3))
+    # Watched as long as the average takes to settle, the window is aimed at the middle of its band.
+    moves = [tick(history, AIM + 1.0).camera for _ in range(round(WINDOW_SMOOTH_SECONDS) + 1)]
+    assert [m for m in moves if m is not None][0] == CameraMove("aperture", "f/5.6")
+
+
+def test_setup_is_not_ready_while_the_window_settles():
+    history = placed()
+    history.last_tick = 0.0
+    assert tick(history, AIM) != Moves()
+    for _ in range(round(WINDOW_SMOOTH_SECONDS)):
+        tick(history, AIM)
+    assert tick(history, AIM) == Moves()
+
+
+def test_a_single_noisy_frame_does_not_move_the_card():
+    history = watching(AIM)
+    assert tick(history, AIM + 0.6).camera is None
+    assert tick(history, AIM).camera is None
+    # The same change held: the average follows it and the card moves darker.
+    moves = [tick(history, AIM + 0.6).camera for _ in range(10)]
+    first = next(m for m in moves if m is not None)
+    assert first.setting == "aperture" and float(first.value.lstrip("f/")) > 4
+
+
+def test_a_window_inside_its_band_leaves_the_card_alone():
+    for off in (0.4, -0.4):  # the band is a stop wide here: 0.4 either side of the middle is inside
+        history = watching(AIM + off)
+        assert all(tick(history, AIM + off).camera is None for _ in range(5))
+    # The first aim from a settled reading still takes it to the middle.
+    assert tick(watching(AIM + 0.4, aimed=False), AIM + 0.4).camera == CameraMove("aperture", "f/4.5")
+
+
+def test_a_clipped_window_darkens_the_card_at_once_and_is_remembered():
+    history = watching(AIM_709)
+    ceiling = camera_exposure(CAMERA)
+    moves = tick(history, AIM_709 + 0.9, clipped=0.1, goal=DEFAULT_709)
+    # A clipped frame's level is only a floor: the average rises to it at once, and the card darkens.
+    assert history.window_scene == pytest.approx(AIM_709 + 0.9)
+    assert history.clip_ceiling == pytest.approx(ceiling)
+    assert moves.camera == CameraMove("aperture", "f/5.6")
+    # The light eases 0.8 stop, more than the band is wide, so the card may turn back and open up; but it
+    # stops a third short of where the window clipped.
+    camera = follow(CAMERA, moves.camera)
+    for _ in range(40):
+        camera = follow(camera, tick(history, AIM_709 + 0.1, camera, goal=DEFAULT_709).camera)
+        assert camera_exposure(camera) <= ceiling - 1 / 3 + 0.05
+    assert camera["aperture"] == "f/4.5"
+    # The light falls more than a stop below where it clipped: the memory clears and the card opens up.
+    for _ in range(40):
+        camera = follow(camera, tick(history, AIM_709 - 1.2, camera, goal=DEFAULT_709).camera)
+    assert history.clip_ceiling is None
+    assert camera_exposure(camera) > ceiling
+
+
+def test_the_card_does_not_turn_back_unless_the_light_moved_more_than_the_band():
+    # The last card was darker, aimed with the window at AIM_709 + 0.5. The light eases half a stop, less than
+    # the band is wide: the window sits low in its band, under it even, and the card stays.
+    history = watching(AIM_709 + 0.5)
+    history.last_move, history.last_move_scene = -1, AIM_709 + 0.5
+    darker = {**CAMERA, "aperture": "f/4.5"}
+    assert all(tick(history, AIM_709, darker, goal=DEFAULT_709).camera is None for _ in range(30))
+
+
+def test_a_clipped_window_never_brightens_the_card():
+    history = watching(AIM - 1.0, aimed=False)  # a dark average: the card would open up
+    assert tick(history, AIM - 1.0, clipped=0.1).camera is None
+
+
+def test_setup_holds_the_card_after_max_card_changes():
+    history, camera, cards = watching(AIM), dict(CAMERA), []
+    for k in range(2 * MAX_CARD_CHANGES):
+        scene = AIM + (1.0 if k % 2 == 0 else -1.0)  # a window that will not settle: one way, then the other
+        history.window_scene = scene
+        for _ in range(3):
+            camera = follow(camera, tick(history, scene, camera).camera)
+        cards.append(camera["aperture"])
+    changes = sum(a != b for a, b in zip([CAMERA["aperture"]] + cards, cards))
+    assert changes == MAX_CARD_CHANGES
+    # A take, start to end, and setup may aim again.
+    start_take(make_scene(camera=camera), history)
+    assert history.card_changes == 0
+    history.card_changes = MAX_CARD_CHANGES
+    end_take(history)
+    history.window_scene = AIM + 1.0
+    assert tick(history, AIM + 1.0, camera).camera is not None

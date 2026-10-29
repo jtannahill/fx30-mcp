@@ -13,16 +13,18 @@ from fx30_mcp.decide import (
     TINT_PER_GREEN,
     TINT_STEP_SECONDS,
     WARM,
+    WINDOW_SMOOTH_SECONDS,
     CameraMove,
     Goal,
     History,
     LightMove,
     Moves,
     RigState,
+    camera_exposure,
     decide,
     start_take,
 )
-from fx30_mcp.plan import Geometry
+from fx30_mcp.plan import Geometry, window_scene
 from fx30_mcp.scene import Scene
 
 FACE_LEVEL = 0.4
@@ -78,10 +80,16 @@ def make_goal(widest=2.8):
     )
 
 
-def taking(scene=None, **fields):
-    """A history as start_take leaves it, the last tick one second ago."""
+def taking(scene=None, window=None, **fields):
+    """A history as start_take leaves it, the last tick one second ago, after a setup that watched the
+    window (window's, else scene's) long enough to act on."""
+    scene = scene or make_scene()
     history = History(gain=1.0, last_tick=NOW - 1.0)
-    start_take(scene or make_scene(), history)
+    start_take(scene, history)
+    watched = window or scene
+    if watched.window is not None:
+        history.window_scene = window_scene(watched.window.level, "rec709", camera_exposure(watched.camera))
+        history.window_seconds = WINDOW_SMOOTH_SECONDS
     for name, value in fields.items():
         setattr(history, name, value)
     return history
@@ -89,7 +97,7 @@ def taking(scene=None, **fields):
 
 def go(scene=None, rig=None, goal=None, history=None, now=NOW):
     scene = scene or make_scene()
-    history = history if history is not None else taking()
+    history = history if history is not None else taking(window=scene)
     return decide(scene, rig or make_rig(**{k: scene.camera[k] for k in EXPOSURE}), goal or make_goal(),
                   "take", history, now)
 
@@ -270,14 +278,35 @@ def test_face_wins_when_the_key_is_at_its_lowest():
     assert "light is at its lowest" in moves.held
 
 
+def held(scene, history, ticks=10):
+    """The first camera step over ticks a second apart, all showing scene, and the tick it came on."""
+    for tick in range(ticks):
+        history.last_tick = NOW + tick - 1
+        moves = go(scene=scene, history=history, now=NOW + tick)
+        if moves.camera is not None:
+            return moves, tick
+    return None, ticks
+
+
 def test_meter_stands_in_for_a_missing_window():
     history = taking(snapshot_meter=0.0)
     assert go(scene=make_scene(window=None, meter=0.2), history=history).camera is None
-    moves = go(scene=make_scene(window=None, meter=1.0), history=history)
+    assert go(scene=make_scene(window=None, meter=1.0), history=history).camera is None  # one frame is noise
+    moves, tick = held(make_scene(window=None, meter=1.0), taking(snapshot_meter=0.0))
+    assert tick >= 1
     assert moves.camera == CameraMove("aperture", "f/14")
     assert moves.light.brightness == pytest.approx(30.0 * 2 ** (1 / 3), abs=0.05)
-    darker = go(scene=make_scene(window=None, meter=-1.0), history=history)
+    darker, _tick = held(make_scene(window=None, meter=-1.0), taking(snapshot_meter=0.0))
     assert darker.camera == CameraMove("aperture", "f/11")
+
+
+def test_the_meter_average_takes_the_camera_out():
+    # A step darker reads that much lower on the camera's meter: the director's own step, not the scene.
+    history = taking()
+    before = history.meter_scene
+    stepped = camera_exposure(CAMERA) - camera_exposure({**CAMERA, "aperture": "f/14"})
+    go(scene=make_scene(window=None, aperture="f/14", meter=-stepped), history=history)
+    assert history.meter_scene == pytest.approx(before)
 
 
 def test_no_meter_and_no_window_leaves_the_camera_alone():
@@ -399,7 +428,9 @@ def test_white_balance_never_moves_in_a_take():
 
 
 def test_take_changes_only_what_it_may():
-    allowed = ("hands_off", "last_tint_step")
+    smoothing = ("window_scene", "window_seconds", "window_bound", "clip_ceiling", "clip_scene", "meter_scene",
+                 "last_move", "last_move_scene")
+    allowed = ("hands_off", "last_tint_step", *smoothing)
     for scene, rig, history in take_table():
         before = dataclasses.replace(history, commanded=dict(history.commanded))
         decide(scene, rig, make_goal(), "take", history, NOW)
@@ -429,3 +460,85 @@ def test_start_take_forgets_the_last_takes_refusal():
     history = History(camera_refused="camera refused f/14")
     start_take(make_scene(), history)
     assert history.camera_refused is None
+
+
+# The window, smoothed: its brightness with the camera taken out, averaged over WINDOW_SMOOTH_SECONDS,
+# stepped for only once it leaves its band. A clipped frame is a floor, and where it clipped is remembered.
+
+
+def seen_at(stops, **camera):
+    """The window `stops` over the face as CAMERA would show it, seen through a camera set differently."""
+    shift = camera_exposure({**CAMERA, **camera}) - camera_exposure(CAMERA)
+    level = meter.from_linear(lin(FACE_LEVEL) * 2 ** (stops + shift), "rec709")
+    return meter.Window(level=level, clipped=0.0, box=(0.0, 0.0, 0.2, 0.2), side="left", blue=0.0)
+
+
+def test_the_window_average_takes_the_camera_out():
+    history = taking()
+    before = history.window_scene
+    for aperture in ("f/14", "f/11", "f/13"):
+        go(scene=make_scene(window=seen_at(0.75, aperture=aperture), aperture=aperture), history=history)
+        assert history.window_scene == pytest.approx(before, abs=0.01)
+
+
+def test_a_single_noisy_frame_does_not_step_the_camera():
+    history = taking()
+    assert go(scene=make_scene(window=window_over(0.75 + 0.6)), history=history).camera is None
+    history.last_tick = NOW
+    assert go(scene=make_scene(), history=history, now=NOW + 1).camera is None
+    # Held, the average follows it out of the band and the camera steps darker.
+    moves, tick = held(make_scene(window=window_over(0.75 + 0.6)), taking())
+    assert tick >= 1
+    assert moves.camera == CameraMove("aperture", "f/14")
+
+
+def test_an_unsettled_window_is_not_stepped_for():
+    history = taking()
+    history.window_scene, history.window_seconds = None, 0.0  # nothing watched: the take started cold
+    moves, tick = held(make_scene(window=ONE_OVER), history, ticks=12)
+    assert tick >= WINDOW_SMOOTH_SECONDS
+    assert moves.camera == CameraMove("aperture", "f/14")
+
+
+def test_a_clipped_frame_is_remembered_through_the_take():
+    history = taking()
+    ceiling = camera_exposure(CAMERA)
+    moves = go(scene=make_scene(window=window_over(0.95, clipped=0.1)), history=history)
+    # A clipped frame's level is only a floor: the average rises to it at once, and the camera steps darker.
+    assert history.window_scene == pytest.approx(window_scene(window_over(0.95).level, "rec709", ceiling))
+    assert history.clip_ceiling == pytest.approx(ceiling)
+    assert moves.camera == CameraMove("aperture", "f/14")
+    # The light eases 0.95 stop: more than the band is wide, less than the stop that forgets a clip. The window
+    # sits low on f/14, and opening up to f/13, where it clipped, is not allowed.
+    history.commanded["aperture"], history.last_camera_step = "f/14", NOW
+    low = make_scene(window=seen_at(0.0, aperture="f/14"), aperture="f/14")
+    for tick in range(1, 40):
+        history.last_tick = NOW + tick - 1
+        assert go(scene=low, history=history, now=NOW + tick).camera is None
+    # The light falls more than a stop below where it clipped: the memory clears and the camera opens up.
+    dark = make_scene(window=seen_at(0.95 - 1.3, aperture="f/14"), aperture="f/14")
+    moves, _tick = held(dark, history, ticks=40)
+    assert history.clip_ceiling is None
+    assert moves.camera == CameraMove("aperture", "f/13")
+
+
+def test_the_camera_does_not_turn_back_unless_the_light_moved_more_than_the_band():
+    # The owner's rule. The last change was a step darker with the window at 0.75 over; the window now sits
+    # just under its band, but the light has moved less than the band's width (2/3 stop) since: it holds.
+    history = taking()
+    history.last_move, history.last_move_scene = -1, history.window_scene
+    low = make_scene(window=window_over(0.75 - 0.5))
+    history.window_scene = window_scene(low.window.level, "rec709", camera_exposure(CAMERA))
+    for tick in range(20):
+        history.last_tick = NOW + tick - 1
+        assert go(scene=low, history=history, now=NOW + tick).camera is None
+    # Moved more than the band since that step, it opens up.
+    lower = make_scene(window=window_over(0.75 - 0.8))
+    moves, _tick = held(lower, history, ticks=20)
+    assert moves.camera == CameraMove("aperture", "f/11")
+    assert history.last_move == 1
+
+
+def test_a_clipped_frame_never_brightens():
+    scene = make_scene(window=window_over(0.0, clipped=0.1))
+    assert go(scene=scene, history=taking(window=make_scene(window=window_over(-1.0)))).camera is None

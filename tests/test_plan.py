@@ -7,6 +7,7 @@ import pytest
 from fx30_mcp import meter
 from fx30_mcp.config import Settings
 from fx30_mcp.plan import (
+    MIN_WINDOW_BAND,
     SHUTTERS,
     camera_card,
     choose_key_side,
@@ -20,7 +21,9 @@ from fx30_mcp.plan import (
     key_geometry,
     make_plan,
     ratio_light,
+    window_band,
     window_light,
+    window_scene,
 )
 from fx30_mcp.sim import SimCamera, SimLight
 from fx30_mcp.survey import survey
@@ -101,6 +104,32 @@ def test_exposure_change():
     change = exposure_change(high, 0.5, "slog3", [2.0, 4.0])
     assert change < 0
     assert 6.0 + change <= 4.0 + 1e-6
+
+
+def test_the_rec709_band_at_the_default_target_is_never_narrower_than_two_thirds():
+    # The owner's FX30, Oct 29: at 0.60 in Rec.709 the band was [1.03, 1.03] and the camera hunted forever.
+    lo, hi = window_band(0.60, "rec709", [2.0, 4.0])
+    assert MIN_WINDOW_BAND == pytest.approx(2 / 3)
+    assert hi == pytest.approx(headroom(0.60, "rec709") - 1 / 3)
+    assert hi - lo >= MIN_WINDOW_BAND - 1e-9
+    assert window_band(0.5, "slog3", [2.0, 4.0]) == (2.0, 4.0)  # plenty of headroom: the range as set
+
+
+def test_exposure_change_aims_the_rec709_window_at_the_middle_of_its_band():
+    lo, hi = window_band(0.60, "rec709", [2.0, 4.0])
+    for stops in (lo + 0.01, (lo + hi) / 2, hi - 0.01):
+        assert exposure_change(window(level_over(0.60, stops, "rec709")), 0.60, "rec709", [2.0, 4.0]) == 0
+    for stops in (lo - 0.3, hi + 0.3):
+        change = exposure_change(window(level_over(0.60, stops, "rec709")), 0.60, "rec709", [2.0, 4.0])
+        assert stops + change == pytest.approx((lo + hi) / 2)
+
+
+def test_window_scene_takes_the_camera_out():
+    # The same window seen a stop darker on a camera set a stop darker is the same scene.
+    bright = meter.from_linear(0.5, "rec709")
+    dark = meter.from_linear(0.25, "rec709")
+    assert window_scene(bright, "rec709", 0.0) == pytest.approx(window_scene(dark, "rec709", -1.0))
+    assert window_scene(bright, "rec709", 0.0) == pytest.approx(-1.0)
 
 
 def test_exposure_change_leaves_a_window_in_range_alone():

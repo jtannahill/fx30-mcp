@@ -1,4 +1,5 @@
 import asyncio
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ from amaran_mcp.link import LinkError
 from fx30_mcp import config, meter
 from fx30_mcp.camera import CameraError
 from fx30_mcp.config import Settings
+from fx30_mcp.decide import CAMERA_STEP_SECONDS
 from fx30_mcp.director import IDLE_END_SECONDS, Director
 from fx30_mcp.plan import exposure_of
 from fx30_mcp.report import Take, report_text
@@ -15,8 +17,8 @@ from fx30_mcp.rig import Rig
 from fx30_mcp.sim import SimCamera, SimLight
 
 SIM_FACE = (100 / 320, 40 / 180, 120 / 320, 100 / 180)
-# With a 4.0 window, f/6.3 at 1/60 and ISO 800 is already the card's answer in rec709.
-SETTLED = "f/6.3"
+# With a 4.0 window, f/7.1 at 1/60 and ISO 800 puts it at the middle of its band in rec709: the card's answer.
+SETTLED = "f/7.1"
 
 
 @pytest.fixture(autouse=True)
@@ -48,8 +50,14 @@ class Clock:
         await asyncio.sleep(0)
 
 
+GLINT = 0.05  # share of the window a glint whites out: past the 2% that counts as clipping, not its median
+
+
 class Watched(SimCamera):
-    """A sim camera that logs what was written to it, its holds, and the face level of each frame."""
+    """A sim camera that logs what was written to it, its holds, and the face level of each frame.
+
+    With noise, each frame's window is that many stops brighter or darker, at random; glint_frames frames
+    are drawn with a glint off the glass."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -62,6 +70,9 @@ class Watched(SimCamera):
         self.fail_frames = False
         self.refuse: set[str] = set()  # values set() refuses, as a lens without f/22 would
         self.record_on_frame = False  # recording starts during the next frame read
+        self.noise = 0.0
+        self.rng = random.Random(29)
+        self.glint_frames = 0
 
     async def set(self, setting, value):
         if value in self.refuse:
@@ -83,7 +94,16 @@ class Watched(SimCamera):
         if self.record_on_frame:
             self.record_on_frame = False
             self.recording = True
-        jpeg = await super().frame()
+        window, glint = self.window, self.glint
+        if self.noise:
+            self.window = window * 2 ** self.rng.uniform(-self.noise, self.noise)
+        if self.glint_frames:
+            self.glint_frames -= 1
+            self.glint = GLINT
+        try:
+            jpeg = await super().frame()
+        finally:
+            self.window, self.glint = window, glint
         if self.recording:
             self.levels.append((self.clock(), meter.read(jpeg, SIM_FACE).lit))
         return jpeg
@@ -665,7 +685,7 @@ def test_camera_readback_in_other_forms_needs_no_card_writes():
     real = camera.settings
 
     async def readback():
-        return {**await real(), "aperture": "6.3", "shutter": '1/60"', "iso": "ISO 800"}
+        return {**await real(), "aperture": "7.1", "shutter": '1/60"', "iso": "ISO 800"}
 
     camera.settings = readback
     settings = Settings(key_modifier="softbox", key_size_in=24)
@@ -733,7 +753,7 @@ def test_unexpected_error_says_so_and_reraises():
 
 def test_a_refused_step_mid_take_is_held_and_the_run_carries_on():
     camera, key = sim(stops_at_full=2.0, curve=1.0)
-    camera.refuse = {"f/7.1"}  # the first step down from f/6.3
+    camera.refuse = {"f/8"}  # the first step down from f/7.1
     director, states, texts, clock = make(camera, key)
     mark = {}
 
@@ -754,33 +774,34 @@ def test_a_refused_step_mid_take_is_held_and_the_run_carries_on():
     assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
     assert "stopped" not in [kind for kind, _ in texts.sent]
     report = director.status()["last_report"]
-    assert "camera refused f/7.1" in report["held"]
-    assert "The camera refused f/7.1" in report["text"]
-    assert any(s["screen"] == "take" and s["detail"] == "Camera refused f/7.1" for s in states)
+    assert "camera refused f/8" in report["held"]
+    assert "The camera refused f/8" in report["text"]
+    assert any(s["screen"] == "take" and s["detail"] == "Camera refused f/8" for s in states)
     snapshot = director.history.snapshot[0]
     assert all(abs(meter.stops_off(level, snapshot, "rec709")) <= 1 / 6 for _t, level in camera.levels)
 
 
 def test_a_refused_setup_write_is_asked_for_by_hand():
     camera, key = sim()
-    camera.values["aperture"] = "f/2.8"  # opened up after calibrating: the card walks f/4, f/5.6, f/8, f/6.3
-    camera.refuse = {"f/4"}
+    # Opened up after calibrating, the window clips: the card darkens f/3.5, f/4.5, f/5.6, f/7.1.
+    camera.values["aperture"] = "f/2.8"
+    camera.refuse = {"f/4.5"}
     director, states, texts, clock = make(camera, key)
     seen = {}
 
     def script(t: float) -> None:
-        if director.status()["instruction"] == "Set f/4 on the camera":
+        if director.status()["instruction"] == "Set f/4.5 on the camera":
             seen.setdefault("t", t)
             if t - seen["t"] >= 2:
-                camera.values["aperture"] = "f/4"  # the owner turns the ring
+                camera.values["aperture"] = "f/4.5"  # the owner turns the ring
         if director.status()["step"] == "ready":
             director.stop()
 
     go(director, clock, script)
     shown = [(s["step"], s["instruction"], s["detail"]) for s in states]
-    asked = shown.index(("camera", "Set f/4 on the camera", "Aperture"))
+    asked = shown.index(("camera", "Set f/4.5 on the camera", "Aperture"))
     assert ("ready", "Ready to record", None) in shown[asked:]
-    assert "f/4" not in [value for _t, setting, value in camera.sets if setting == "aperture"]
+    assert "f/4.5" not in [value for _t, setting, value in camera.sets if setting == "aperture"]
     assert camera.values["aperture"] == SETTLED  # the rest of the card went over USB
     assert director.history.refused == {}
     assert texts.sent == []
@@ -955,3 +976,118 @@ def test_no_key_check_once_recording_has_started():
     before = asyncio.run(main())
     assert director.status()["last_report"]["take"] == 1
     assert not [on for _t, on in key.powers[before:] if not on]  # the key never went off mid-take
+
+
+# The window, smoothed and aimed once: the Oct 29 hunt in Rec.709, and the owner's rule that it does not jump.
+
+
+def exposures(camera, start):
+    """(time, exposure) after each exposure write, from the values the camera started at."""
+    values, out = dict(start), []
+    for t, setting, value in camera.sets:
+        if setting in ("iso", "shutter", "aperture"):
+            values[setting] = value
+            out.append((t, exposure_of(values["iso"], values["shutter"], values["aperture"])))
+    return out
+
+
+def reversals(camera, start):
+    """How many times the camera's exposure turned back: darker then brighter, or brighter then darker."""
+    steps = [exposure_of(**start)] + [e for _t, e in exposures(camera, start)]
+    turns = [b > a for a, b in zip(steps, steps[1:]) if abs(b - a) > 1e-6]
+    return sum(a != b for a, b in zip(turns, turns[1:]))
+
+
+def test_a_clipping_window_is_found_without_hunting():
+    camera, key = sim()
+    camera.values["aperture"] = "f/4"  # opened up after calibrating: the window clips at f/5.6 and wider
+    start = dict(camera.values)
+    director, states, texts, clock = make(camera, key)
+    mark = {}
+
+    def then(s: float) -> None:
+        mark.setdefault("ready", clock.t)
+        if s > 30:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    written = exposures(camera, start)
+    assert 1 <= len(written) <= 3
+    steps = [exposure_of(**start)] + [e for _t, e in written]
+    assert all(b < a for a, b in zip(steps, steps[1:]))  # darker every time: no reversal, no loop
+    assert all(t < mark["ready"] for t, _e in written)  # and none once Ready
+    assert camera.values["aperture"] == SETTLED
+
+
+def test_window_noise_makes_no_camera_steps_in_a_two_minute_take():
+    camera, key = sim()
+    camera.noise = 0.3
+    director, states, texts, clock = make(camera, key)
+    mark = {}
+
+    def then(s: float) -> None:
+        if s >= 1 and "start" not in mark:
+            camera.recording = True
+            mark["start"] = clock.t
+        if "start" in mark and clock.t - mark["start"] > 120:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    assert not [s for s in camera.sets if s[0] >= mark["start"]]
+    report = director.status()["last_report"]
+    assert report["seconds"] >= 120 and report["camera_steps"] == 0
+
+
+def test_a_slow_two_stop_brightening_only_darkens_one_step_at_a_time():
+    camera, key = sim(stops_at_full=3.0, curve=1.0)
+    camera.noise = 0.3
+    start = dict(camera.values)
+    director, states, texts, clock = make(camera, key)
+    mark = {}
+
+    def then(s: float) -> None:
+        if s >= 1 and "start" not in mark:
+            camera.recording = True
+            mark["start"] = clock.t
+        if s >= 5:
+            camera.window = 4.0 * 2 ** (2 * min(s - 5, 60) / 60)
+        if s > 95:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    steps = [(t, e) for t, e in exposures(camera, start) if t >= mark["start"]]
+    assert len(steps) >= 4
+    before = [exposure_of(**start)] + [e for _t, e in steps]
+    assert all(b < a for a, b in zip(before, before[1:]))
+    times = [t for t, _e in steps]
+    assert all(b - a >= CAMERA_STEP_SECONDS for a, b in zip(times, times[1:]))
+
+
+def test_it_does_not_jump():
+    """The owner's rule: the exposure never turns back unless the scene has moved more than the band.
+
+    Setup, then a 2-minute take, with the window noisy by up to a third of a stop either way every frame
+    and a glint off the glass clipping part of it every 10 s; the scene itself never changes."""
+
+    camera, key = sim()
+    camera.noise = 0.3
+    start = dict(camera.values)
+    director, states, texts, clock = make(camera, key)
+    mark = {"glint": 0.0}
+
+    def script(t: float) -> None:
+        if t - mark["glint"] >= 10:
+            mark["glint"] = t
+            camera.glint_frames = 1
+        if "ready" not in mark and director.status()["step"] == "ready":
+            mark["ready"] = t
+        if "ready" in mark and "start" not in mark and t - mark["ready"] >= 1:
+            camera.recording = True
+            mark["start"] = t
+        if "start" in mark and t - mark["start"] > 120:
+            director.stop()
+
+    go(director, clock, script)
+    assert "start" in mark and clock.t - mark["start"] > 120
+    assert director.history.clip_ceiling is not None  # the glints were seen as clipping
+    assert reversals(camera, start) == 0

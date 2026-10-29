@@ -5,7 +5,8 @@ with brightness (along a curve, as real dimmers are), greener or more magenta
 with tint and with a green cast from the "room". With key_spill below 1 the key
 lights the left half of the face more than the right, which a fill light lifts.
 A window, room ambient light, the key's side and distance, and the camera's own
-exposure (ISO, shutter, aperture) shape the rest of the scene.
+exposure (ISO, shutter, aperture) shape the rest of the scene. A glint whites out
+the top of the window, as sun off a car would: part of it clips, its median does not.
 """
 
 from __future__ import annotations
@@ -88,6 +89,7 @@ class SimCamera(CameraBase):
         fill_gain: float = 1.0,
         key_spill: float = 1.0,  # share of the key reaching the half of the face away from the key
         window: float = 0.0,  # linear level of a window at the right of the frame, 0 for none
+        glint: float = 0.0,  # share of the window drawn at white
         ambient: float = 0.0,  # room light on the face, mostly on the rim_side half
         rim_side: str = "right",
         key_side: str = "left",
@@ -109,6 +111,7 @@ class SimCamera(CameraBase):
         self.fill_gain = fill_gain
         self.key_spill = key_spill
         self.window = window
+        self.glint = glint
         self.ambient = ambient
         self.rim_side = rim_side
         self.key_side = key_side
@@ -152,6 +155,7 @@ class SimCamera(CameraBase):
         frame = np.full((180, 320, 3), float(encode(np.array(0.02 * key * scale))))
         if self.window:
             frame[0:140, 250:320] = encode(np.array(self.window * scale))
+            frame[0 : round(140 * self.glint), 250:320] = 1.0
         for x, half in ((100, 0), (160, 1)):
             other = (fill_halves[half] + self.ambient * rim[half]) * scale
             level = tone * other + tone * key_tint * key_halves[half] * scale

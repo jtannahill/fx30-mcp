@@ -22,6 +22,10 @@ SHUTTERS = ["1/50", "1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250",
 STOP_APERTURE = APERTURES.index(16.0)  # stop down this far before raising the shutter
 TURNED_DEGREES = 15
 UNEVEN_STOPS = 1 / 3
+WINDOW_CLIPPED = 0.02  # more of the window than this at white: its level is only a floor
+# Stops: the window's band is never narrower, however little headroom the profile leaves (Rec.709 at 0.60
+# has 1.36 stops over the face; without this the band was 1.03 to 1.03 and the camera hunted forever).
+MIN_WINDOW_BAND = 2 / 3
 ND_NOTE = "Shutter above {base} makes motion a little crisper. A variable ND would bring it back to {base}."
 
 
@@ -98,18 +102,32 @@ def headroom(target: float, profile: str) -> float:
     return meter.stops_off(target, CLIP[profile], profile)
 
 
+def window_band(target: float, profile: str, window_range: list[float]) -> tuple[float, float]:
+    """Stops over the face the window may sit between: its top a third below white, at least MIN_WINDOW_BAND wide."""
+
+    hi = min(window_range[1], headroom(target, profile) - 1 / 3)
+    return min(window_range[0], hi - MIN_WINDOW_BAND), hi
+
+
+def window_scene(level: float, profile: str, exposure: float) -> float:
+    """The window's brightness with the camera taken out: stops as ISO 800, 1/60 and f/2.8 would show it.
+    Changing the camera does not change it; changing the light does."""
+
+    return math.log2(max(meter.to_linear(level, profile), 1e-6)) - exposure
+
+
 def exposure_change(window: meter.Window | None, target: float, profile: str, window_range: list[float]) -> float:
-    """Stops to add to the camera (negative darkens) so the window sits inside its range over the face."""
+    """Stops to add to the camera (negative darkens) so the window sits at the middle of its band over the face."""
 
     if window is None:
         return 0.0
-    if window.clipped > 0.02:
+    if window.clipped > WINDOW_CLIPPED:
         return -1.0  # a step, then measure again: a clipped window says nothing about how far over it is
-    cap = min(window_range[1], headroom(target, profile) - 1 / 3)
+    lo, hi = window_band(target, profile, window_range)
     over = meter.stops_off(target, window.level, profile)
-    if min(window_range[0], cap) <= over <= cap:
-        return 0.0  # already in range: leave the camera alone
-    return cap - over
+    if lo <= over <= hi:
+        return 0.0  # already in its band: leave the camera alone
+    return (lo + hi) / 2 - over
 
 
 @dataclass
@@ -194,11 +212,12 @@ def window_light(
         return None
     if not truthful:
         return "amber"
-    if window.clipped > 0.02:
+    if window.clipped > WINDOW_CLIPPED:
         return "red"
     over = meter.stops_off(face_level, window.level, profile)
     to_clip = meter.stops_off(window.level, CLIP[profile], profile)
-    dull = min(AMBER_BELOW, headroom(face_level, profile) - 2 / 3)
+    # The bottom of the band the director aims in, so a window at its aim reads green, not amber and green by turns.
+    dull = min(AMBER_BELOW, headroom(face_level, profile) - 1 / 3 - MIN_WINDOW_BAND)
     return "amber" if over < dull or to_clip < 1 / 3 else "green"
 
 

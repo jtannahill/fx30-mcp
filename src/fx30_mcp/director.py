@@ -34,13 +34,15 @@ from .decide import (
     RigState,
     _number,
     by_hand,
+    camera_exposure,
     canonical,
     decide,
+    end_take,
     key_placed,
     start_take,
 )
 from .notify import Texts, send_later
-from .plan import Plan, _widest_offered, exposure_of, face_light, key_geometry, make_plan, window_light
+from .plan import Plan, _widest_offered, face_light, key_geometry, make_plan, window_light
 from .rig import LightError, LightUnreachable, Rig
 from .report import Take, capital, report_text
 from .scene import Scene, read_scene
@@ -71,15 +73,6 @@ BALANCE_UNREACHABLE = (
 
 class _Stopped(Exception):
     pass
-
-
-def _exposure(camera: dict[str, Any]) -> float | None:
-    """Stops of exposure from the camera's readback, which comes in several forms ("ISO 800", '1/60"', "6.3")."""
-
-    try:
-        return exposure_of(*(canonical(s, camera[s]) for s in ("iso", "shutter", "aperture")))
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-        return None
 
 
 class Director:
@@ -459,7 +452,7 @@ class Director:
         if not scene.face:
             self.history.snapshot = None  # taken when the face is back: a take holds a face, not a wall
         self._takes += 1
-        self._take = Take(self._takes, now, scene.camera.get("meter"), now, exposure=_exposure(scene.camera))
+        self._take = Take(self._takes, now, scene.camera.get("meter"), now, exposure=camera_exposure(scene.camera))
         self.mode = "take"
         self._mark = None
         self._quiet = 0
@@ -470,14 +463,14 @@ class Director:
         if history.snapshot is None and scene.face:
             start_take(scene, history)
             take.meter = scene.camera.get("meter")
-            take.exposure = _exposure(scene.camera)
+            take.exposure = camera_exposure(scene.camera)
         level = history.snapshot[0] if history.snapshot is not None else self.goal.face_level
         self._judge(scene.face, scene.level, scene.window, level)
         moves = decide(scene, rig, self.goal, "take", history, now)
         history.last_tick = now
         lights = self._lights
         green, red = lights["face"] == "green", lights["window"] == "red"
-        take.tick(now, scene.camera.get("meter"), green, red, moves.held, _exposure(scene.camera))
+        take.tick(now, scene.camera.get("meter"), green, red, moves.held, camera_exposure(scene.camera))
         applied = moves if self.camera_moves else dataclasses.replace(moves, camera=None)
         stepped = history.last_camera_step
         held = moves.held
@@ -503,9 +496,10 @@ class Director:
 
     def _end_take(self, scene: Scene, now: float) -> None:
         self._take.meter_now = scene.camera.get("meter")
-        self._take.exposure_now = _exposure(scene.camera)
+        self._take.exposure_now = camera_exposure(scene.camera)
         self._take.last = now
         self.last_report = self._finish_take()
+        end_take(self.history)  # setup may aim new cards before the next take
         self.mode = "setup"
         self._idle_since = now
         self._quiet = 0
@@ -609,7 +603,7 @@ class Director:
     def _save_key_output(self, scene: Scene, rig: RigState) -> None:
         """Remember what the key does at full from where it is, for the next plan's key percent."""
 
-        brightness, exposure = rig.brightness, _exposure(scene.camera)
+        brightness, exposure = rig.brightness, camera_exposure(scene.camera)
         if not scene.face or not brightness or exposure is None:
             return
         stops = meter.stops_off(scene.level, self.goal.face_level, self.profile)

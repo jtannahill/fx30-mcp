@@ -2,12 +2,21 @@
 
 decide() looks at one Scene, the rig as last written, the goal and the history, and returns
 Moves: at most one light move, one camera move and one thing to ask of the person. It is pure
-apart from updating history.gain, history.last_stops and history.refused in setup, and
-history.hands_off and history.last_tint_step in a take. Setup mode brings the shot to Ready; a value
+apart from updating history.gain, history.last_stops, history.refused and the card it aims at in setup,
+history.hands_off, history.last_tint_step and the meter's average in a take, and the window's average,
+clip memory and last move in both. Setup mode brings the shot to Ready; a value
 the camera refused to take over USB is asked for by hand until the camera reads it. Balance mode is setup for the
 light alone: no camera move and no key placement, for balance_shot. Take mode holds what recording
 started with (start_take), slowly enough that a viewer never sees a change, and never asks.
 The Rig applies the moves and the Director owns the history.
+
+The window is judged by its brightness with the camera taken out (plan.window_scene), averaged over
+WINDOW_SMOOTH_SECONDS, so one noisy frame moves nothing and the director's own steps never read as the light
+changing. Setup aims it once at the middle of its band and then, like a take, moves only when it leaves
+the band. A clipped frame is only a floor, so it can only darken, and the exposure it clipped at is
+remembered: the camera never opens up to within CLIP_MARGIN of it until the light falls well below.
+And the owner's rule, that it does not jump: the exposure never turns back (darker then brighter, or
+brighter then darker) unless the average has moved more than the band is wide since the last change.
 """
 
 from __future__ import annotations
@@ -22,11 +31,15 @@ from .plan import (
     MIN_KEY_FT,
     SHUTTERS,
     UNEVEN_STOPS,
+    WINDOW_CLIPPED,
+    CameraCard,
     Geometry,
     camera_card,
     closer,
-    exposure_change,
+    exposure_of,
     fmt_ft,
+    window_band,
+    window_scene,
 )
 from .scene import Scene
 from .survey import KeyCheck
@@ -63,6 +76,14 @@ KELVIN_PER_WARM = 4000.0  # key kelvin that undoes one unit along WARM (first gu
 TINT_PER_GREEN = 60.0  # tint steps that undo one unit along GREEN (first guess)
 KELVIN_DEADBAND = 50  # K; smaller corrections are noise in the face's colour
 EXPOSURE_SETTINGS = ("aperture", "iso", "shutter")  # the order a take steps them in, least visible first
+
+# The window, in setup and in a take.
+WINDOW_SMOOTH_SECONDS = 4.0  # the average's time constant; an unclipped average younger than this aims nothing
+WINDOW_MAX_DT = 2.0  # seconds: a frame after a long gap (a key check) counts no more than this toward the average
+CLIP_MARGIN = 1 / 3  # stops: opening up stops this far short of an exposure the window clipped at
+CLIP_FORGET = 1.0  # stops the average must fall below where the window clipped before that is forgotten
+ROUNDING = 0.05  # stops: nominal values ("f/14", "1/125") are rounded
+MAX_CARD_CHANGES = 6  # setup: new cards aimed at before the card is held (a clipped window still darkens it)
 
 CANT_HOLD = "A sheer curtain or ND film on the glass would. Or open up and let the window sit brighter."
 DARKEST = ("The camera can't darken this window any further", "ND film or a sheer curtain on the glass would.")
@@ -150,6 +171,18 @@ class History:  # owned by the Director, read by decide
     last_camera_step: float = -math.inf
     last_tint_step: float = -math.inf
     last_tick: float | None = None
+    # The window's brightness with the camera taken out (plan.window_scene), averaged over WINDOW_SMOOTH_SECONDS.
+    window_scene: float | None = None
+    window_seconds: float = 0.0  # how long the average has run since it started, or since a clipped floor
+    window_bound: bool = False  # the average is a clipped frame's floor, not a reading
+    clip_ceiling: float | None = None  # the lowest camera exposure the window was seen clipping at
+    clip_scene: float | None = None  # the average when it last clipped
+    aimed: bool = False  # setup has aimed the window at the middle of its band from a settled average
+    card: CameraCard | None = None  # setup: the card last aimed at
+    card_changes: int = 0  # setup: new cards aimed at since setup began or the last take
+    last_move: int = 0  # the director's last change of exposure for the window: -1 darker, 1 brighter
+    last_move_scene: float | None = None  # the window's average when it made it
+    meter_scene: float | None = None  # take: the camera's meter with its exposure taken out, averaged
 
 
 def _number(setting: str, text: Any) -> float | None:
@@ -185,9 +218,22 @@ def canonical(setting: str, value: Any) -> str | None:
     return f"{number:g}"
 
 
+def camera_exposure(camera: dict[str, Any]) -> float | None:
+    """Stops of exposure (plan.exposure_of) from the camera's readback in any of its forms; None when it
+    cannot say."""
+
+    values = [canonical(s, camera.get(s)) for s in ("iso", "shutter", "aperture")]
+    if None in values:
+        return None
+    try:
+        return exposure_of(*values)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def decide(scene: Scene, rig: RigState, goal: Goal, mode: str, history: History, now: float) -> Moves:
     if mode in ("setup", "balance"):
-        return _setup(scene, rig, goal, history, light_only=mode == "balance")
+        return _setup(scene, rig, goal, history, now, light_only=mode == "balance")
     if mode == "take":
         return _take(scene, rig, goal, history, now)
     raise ValueError(f"unknown mode {mode!r}")
@@ -198,6 +244,11 @@ def start_take(scene: Scene, history: History) -> None:
 
     history.snapshot = (scene.level, scene.cb, scene.cr)
     history.snapshot_meter = scene.camera.get("meter")
+    exposure = camera_exposure(scene.camera)
+    history.meter_scene = None
+    if history.snapshot_meter is not None and exposure is not None:
+        history.meter_scene = history.snapshot_meter - exposure  # the meter rises with exposure: take it out
+    history.card, history.card_changes = None, 0
     history.hands_off = False
     history.camera_refused = None
     # A take reads the gain but never learns it: capped at 1/6 stop a second it can hardly overshoot,
@@ -212,6 +263,98 @@ def start_take(scene: Scene, history: History) -> None:
             history.commanded[setting] = value
 
 
+def end_take(history: History) -> None:
+    """Recording has stopped: setup may aim new cards again."""
+
+    history.card, history.card_changes = None, 0
+
+
+def _dt(history: History, now: float) -> float:
+    """Seconds since the last tick, as the window's and the meter's averages count them."""
+
+    dt = TAKE_TICK_SECONDS if history.last_tick is None else now - history.last_tick
+    return min(WINDOW_MAX_DT, max(0.0, dt))
+
+
+def _smooth(average: float | None, reading: float, dt: float) -> float:
+    if average is None:
+        return reading  # the first reading starts the average
+    return average + (1 - math.exp(-dt / WINDOW_SMOOTH_SECONDS)) * (reading - average)
+
+
+def _watch_window(window: meter.Window, profile: str, exposure: float, history: History, now: float) -> bool:
+    """Fold this frame's window into the average and the clip memory; True when it is clipping.
+
+    A clipped frame's level is only a floor: the average rises to it at once and never falls for it. The
+    first real reading after a floor replaces it, since a floor says nothing about how far over it is."""
+
+    reading = window_scene(window.level, profile, exposure)
+    clipped = window.clipped > WINDOW_CLIPPED
+    dt = _dt(history, now)
+    average = history.window_scene
+    if clipped:
+        if average is None or reading > average:
+            history.window_scene, history.window_seconds, history.window_bound = reading, 0.0, True
+        else:
+            history.window_seconds += dt
+    elif average is None or (history.window_bound and reading > average):
+        history.window_scene, history.window_seconds, history.window_bound = reading, 0.0, False
+    else:
+        history.window_scene = _smooth(average, reading, dt)
+        history.window_seconds += dt
+        history.window_bound = False
+    if clipped:
+        history.clip_ceiling = exposure if history.clip_ceiling is None else min(history.clip_ceiling, exposure)
+        history.clip_scene = history.window_scene
+    elif history.clip_ceiling is not None and history.window_scene < history.clip_scene - CLIP_FORGET:
+        history.clip_ceiling = history.clip_scene = None  # the light changed: a cloud, the evening
+    return clipped
+
+
+def _window_wanted(history: History, goal: Goal, target: float) -> tuple[float, float]:
+    """The camera exposure that puts the average window at the middle of its band over target, and how far
+    either side of it the band reaches."""
+
+    lo, hi = window_band(target, goal.profile, goal.window_range)
+    wanted = math.log2(meter.to_linear(target, goal.profile)) + (lo + hi) / 2 - history.window_scene
+    return wanted, (hi - lo) / 2
+
+
+def _capped(wanted: float, exposure: float, history: History, clipped: bool) -> float:
+    """wanted, but never brighter than now for a clipped frame, nor within CLIP_MARGIN of where it clipped."""
+
+    if wanted <= exposure:
+        return wanted
+    if clipped:
+        return exposure
+    if history.clip_ceiling is not None:
+        return max(exposure, min(wanted, history.clip_ceiling - CLIP_MARGIN))
+    return wanted
+
+
+def _turns_back(stops: float, history: History, band: float) -> bool:
+    """Moving by stops would reverse the last change while the average has moved no more than band since."""
+
+    if stops == 0 or history.last_move == 0 or (stops > 0) == (history.last_move > 0):
+        return False
+    return abs(history.window_scene - history.last_move_scene) <= band
+
+
+def _moved(stops: float, history: History) -> None:
+    """Remember which way the exposure just moved for the window, and the average it moved at."""
+
+    history.last_move, history.last_move_scene = (1 if stops > 0 else -1), history.window_scene
+
+
+def _near_clip(scene: Scene, step: CameraMove, history: History) -> bool:
+    """Opening up by step would take the camera within CLIP_MARGIN of an exposure the window clipped at."""
+
+    if history.clip_ceiling is None:
+        return False
+    after = camera_exposure({**scene.camera, step.setting: step.value})
+    return after is not None and after > history.clip_ceiling - CLIP_MARGIN + ROUNDING
+
+
 def _camera_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
     camera = rig.camera
     if camera.get("live_view_effect") is False:
@@ -223,17 +366,61 @@ def _camera_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
     return None
 
 
-def _card_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
-    stops = exposure_change(scene.window, goal.face_level, goal.profile, goal.window_range)
-    # The camera reads back in several forms ("ISO 800", '1/60"', "6.3"); the card wants one.
-    readback = {s: canonical(s, rig.camera[s]) for s in CARD_SETTINGS if rig.camera.get(s) is not None}
-    card = camera_card({**rig.camera, **readback}, stops, goal.frame_rate, goal.widest, scene.window is not None)
+def _card_values(card: CameraCard | dict[str, Any]) -> tuple[str | None, ...]:
+    get = card.get if isinstance(card, dict) else lambda s: getattr(card, s)
+    return tuple(canonical(s, get(s)) for s in CARD_SETTINGS)
+
+
+def _toward(card: CameraCard | None, rig: RigState) -> CameraMove | None:
+    """The first setting of card the camera does not read yet: one setting per tick."""
+
+    if card is None:
+        return None
     for setting in CARD_SETTINGS:
         current = canonical(setting, rig.camera.get(setting))
         wanted = canonical(setting, getattr(card, setting))
         if current is not None and current != wanted:
             return CameraMove(setting, getattr(card, setting))
     return None
+
+
+def _card_move(
+    scene: Scene, rig: RigState, goal: Goal, history: History, now: float
+) -> tuple[CameraMove | None, str | None]:
+    """The next card setting to write, and why the card waits when it is waiting on the window."""
+
+    # The camera reads back in several forms ("ISO 800", '1/60"', "6.3"); the card wants one.
+    readback = {s: canonical(s, rig.camera[s]) for s in CARD_SETTINGS if rig.camera.get(s) is not None}
+    current = {**rig.camera, **readback}
+    if scene.window is None:
+        return _toward(camera_card(current, 0.0, goal.frame_rate, goal.widest, False), rig), None
+    exposure = camera_exposure(rig.camera)
+    if exposure is None:
+        return None, None
+    clipped = _watch_window(scene.window, goal.profile, exposure, history, now)
+    wanted, half = _window_wanted(history, goal, goal.face_level)
+    if not clipped:
+        if history.window_seconds < WINDOW_SMOOTH_SECONDS:
+            return None, "window settling"
+        if history.aimed and abs(exposure - wanted) <= half:
+            return None, None  # inside its band: leave the card alone
+        history.aimed = True  # aim once at the middle; from here on only leaving the band moves it
+    stops = _capped(wanted, exposure, history, clipped) - exposure
+    if clipped and stops > -STOP_TOLERANCE:
+        return None, None  # clipping, but no darker than the average already says: nothing new to aim at
+    if _turns_back(stops, history, 2 * half):
+        return None, None
+    if stops > 0 and history.clip_ceiling is not None:
+        stops = math.floor(3 * (stops + ROUNDING)) / 3  # whole thirds, so the card's rounding cannot pass the cap
+    card = camera_card(current, stops, goal.frame_rate, goal.widest, True)
+    if _card_values(card) != _card_values(history.card or current):
+        # Past MAX_CARD_CHANGES the card holds; a clipped window only ever darkens it, so it cannot loop.
+        if history.card_changes < MAX_CARD_CHANGES or clipped:
+            history.card, history.card_changes = card, history.card_changes + 1
+            change = exposure_of(card.iso, card.shutter, card.aperture) - exposure
+            if abs(change) > ROUNDING:
+                _moved(change, history)
+    return _toward(history.card, rig), None
 
 
 def _reads_as(setting: str, readback: Any, value: str) -> bool:
@@ -314,7 +501,7 @@ def _learn_gain(stops: float, history: History) -> None:
     history.last_stops = stops
 
 
-def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only: bool = False) -> Moves:
+def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, now: float, light_only: bool = False) -> Moves:
     """Light only (balance mode) leaves the camera and the key's placement as they are."""
 
     for setting, value in list(history.refused.items()):
@@ -325,12 +512,12 @@ def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only
         return _write_or_ask(move, history)
     if not scene.face:
         return Moves(ask=Ask(*NO_FACE))
-    move = None if light_only else _card_move(scene, rig, goal)
+    move, held = (None, None) if light_only else _card_move(scene, rig, goal, history, now)
     if move is not None:
         return _write_or_ask(move, history)
     ask = None if light_only else _key_ask(goal, history)
     if ask is not None:
-        return Moves(ask=ask)
+        return Moves(ask=ask, held=held)
 
     stops = meter.stops_off(scene.level, goal.face_level, goal.profile)
     if scene.clipped > CLIP_LIMIT:
@@ -359,7 +546,7 @@ def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only
     light = None
     if (new_brightness, tint) != (round(brightness, 1), rig.tint):
         light = LightMove(new_brightness, goal.kelvin, tint)
-    return Moves(light=light, ask=ask)
+    return Moves(light=light, ask=ask, held=held)  # held: not Ready while the window settles
 
 
 def _hand_changed(scene: Scene, history: History, now: float) -> bool:
@@ -420,15 +607,27 @@ def _next_step(scene: Scene, goal: Goal, darker: bool) -> tuple[CameraMove | Non
     return None, off_ladder
 
 
-def _window_stops(scene: Scene, goal: Goal, history: History, face_level: float) -> float:
-    """Stops to add to the camera for the window; the camera's meter speaks for a window it cannot see."""
+def _window_stops(scene: Scene, goal: Goal, history: History, face_level: float, now: float) -> float:
+    """Stops toward where the window should be, 0 to hold: once the average has left its band, or on a
+    clipped frame. The camera's meter speaks for a window it cannot see."""
 
-    if scene.window is not None:
-        return exposure_change(scene.window, face_level, goal.profile, goal.window_range)
-    now_meter, start_meter = scene.camera.get("meter"), history.snapshot_meter
-    if now_meter is None or start_meter is None:
+    exposure = camera_exposure(scene.camera)
+    if exposure is None:
         return 0.0
-    change = now_meter - start_meter
+    meter_now = scene.camera.get("meter")
+    if meter_now is not None:
+        # The meter rises with exposure: taken out, the director's own steps are not the light changing.
+        history.meter_scene = _smooth(history.meter_scene, meter_now - exposure, _dt(history, now))
+    if scene.window is not None:
+        clipped = _watch_window(scene.window, goal.profile, exposure, history, now)
+        wanted, half = _window_wanted(history, goal, face_level)
+        if not clipped and (history.window_seconds < WINDOW_SMOOTH_SECONDS or abs(exposure - wanted) <= half):
+            return 0.0
+        stops = _capped(wanted, exposure, history, clipped) - exposure
+        return 0.0 if _turns_back(stops, history, 2 * half) else stops
+    if history.snapshot_meter is None or history.meter_scene is None:
+        return 0.0
+    change = history.meter_scene + exposure - history.snapshot_meter  # the meter now, smoothed, against record start
     return -change if abs(change) > METER_STANDS_IN else 0.0
 
 
@@ -479,7 +678,7 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
 
     # The window: one 1/3 camera step, paired with the opposite change on the key. The face wins.
     camera = None
-    window = _window_stops(scene, goal, history, level0)
+    window = _window_stops(scene, goal, history, level0, now)
     if abs(window) > STOP_TOLERANCE:
         darker = window < 0
         what = "window clipping" if darker else "window too dark"
@@ -490,7 +689,9 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
         elif now - history.last_camera_step >= CAMERA_STEP_SECONDS:
             step, off_ladder = _next_step(scene, goal, darker)
             paired = new_brightness * 2 ** (STEP if darker else -STEP)
-            if step is None:
+            if step is not None and not darker and _near_clip(scene, step, history):
+                pass  # a step brighter is within a third of where the window clipped: it sits low instead
+            elif step is None:
                 held = f"{what}; off the ladder" if off_ladder else f"{what}; nothing left to step"
             elif paired > 100.0:
                 held = f"{what}; the light is at full"
@@ -498,6 +699,8 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
                 held = f"{what}; the light is at its lowest"
             else:
                 camera, new_brightness = step, paired
+                if scene.window is not None:
+                    _moved(window, history)
     elif history.hands_off:
         held = "camera changed by hand"
 
