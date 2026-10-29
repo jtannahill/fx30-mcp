@@ -199,15 +199,12 @@ def test_no_ask_mentions_tapping():
         assert "Tap" not in ask.instruction and "Tap" not in (ask.detail or "")
 
 
-@pytest.mark.parametrize("brightness,gain", [(50.0, 1 / 128), (5.0, 1 / 16)])
-def test_a_halved_gain_mid_range_never_asks_to_move_the_key(brightness, gain):
-    # After several overshoots the step can round to nothing; the key can still move, so no ask.
+@pytest.mark.parametrize("brightness,gain", [(50.0, 1 / 256), (5.0, 1 / 32)])
+@pytest.mark.parametrize("stops", [0.25, -0.25])
+def test_a_halved_gain_mid_range_never_asks_to_move_the_key(brightness, gain, stops):
+    # After several overshoots the step rounds to nothing; the key can still move, so it moves, never asks.
     history = placed()
     history.gain = gain
-    moves = go(scene=make_scene(level=level_for(0.17)), rig=make_rig(brightness=brightness), history=history)
+    moves = go(scene=make_scene(level=level_for(stops)), rig=make_rig(brightness=brightness), history=history)
     assert moves.ask is None
-    assert moves.light is None or isinstance(moves.light, LightMove)
-    history.gain = gain
-    history.last_stops = None
-    moves = go(scene=make_scene(level=level_for(-0.17)), rig=make_rig(brightness=brightness), history=history)
-    assert moves.ask is None
+    assert (moves.light.brightness - brightness) * stops > 0

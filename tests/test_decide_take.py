@@ -160,6 +160,24 @@ def test_small_face_drift_is_left_alone():
     assert go(scene=make_scene(level=level_for(0.1))).light is None
 
 
+def test_a_swinging_face_does_not_wear_down_the_gain():
+    history = taking()
+    for tick in range(10):
+        stops = 0.3 if tick % 2 else -0.3
+        go(scene=make_scene(level=level_for(stops)), history=history, now=NOW + tick)
+        history.last_tick = NOW + tick
+    assert history.gain == 1.0
+    moves = go(scene=make_scene(level=level_for(1.0)), history=history, now=NOW + 10)
+    assert moves.light.brightness == pytest.approx(30.0 * 2 ** BRIGHTNESS_STOPS_PER_SECOND, abs=0.05)
+
+
+def test_start_take_resets_the_gain():
+    history = History(gain=1 / 16, last_stops=0.4)
+    start_take(make_scene(), history)
+    assert history.gain == 1.0
+    assert history.last_stops is None
+
+
 def test_face_under_with_the_key_at_full_is_held_not_asked():
     moves = go(scene=make_scene(level=level_for(1.0)), rig=make_rig(brightness=100.0))
     assert moves.light is None and moves.ask is None
@@ -202,6 +220,20 @@ def test_nothing_left_to_step_is_held():
     moves = go(scene=scene, history=taking(scene))
     assert moves.camera is None
     assert "nothing left to step" in moves.held
+
+
+def test_a_step_off_the_ladder_is_never_more_than_a_third():
+    # The take started at f/1.8 on a lens that opens to f/1.4: the next rung, f/2.8, is 1.3 stops away.
+    scene = make_scene(window=CLIPPING, aperture="f/1.8")
+    moves = go(scene=scene, goal=make_goal(widest=1.4), history=taking(scene))
+    assert moves.camera == CameraMove("iso", "640")
+
+
+def test_nothing_within_a_third_is_held_off_the_ladder():
+    scene = make_scene(window=CLIPPING, aperture="f/1.8", iso="6400", shutter="1/30")
+    moves = go(scene=scene, goal=make_goal(widest=1.4), history=taking(scene))
+    assert moves.camera is None
+    assert "off the ladder" in moves.held
 
 
 def test_a_darker_window_opens_up_and_dims_the_key():
@@ -367,7 +399,7 @@ def test_white_balance_never_moves_in_a_take():
 
 
 def test_take_changes_only_what_it_may():
-    allowed = ("hands_off", "last_tint_step", "gain", "last_stops")
+    allowed = ("hands_off", "last_tint_step")
     for scene, rig, history in take_table():
         before = dataclasses.replace(history, commanded=dict(history.commanded))
         decide(scene, rig, make_goal(), "take", history, NOW)

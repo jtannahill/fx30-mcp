@@ -2,8 +2,8 @@
 
 decide() looks at one Scene, the rig as last written, the goal and the history, and returns
 Moves: at most one light move, one camera move and one thing to ask of the person. It is pure
-apart from updating history.gain and history.last_stops (and, in a take, history.hands_off and
-history.last_tint_step). Setup mode brings the shot to Ready. Take mode holds what recording
+apart from updating history.gain and history.last_stops in setup, and history.hands_off and
+history.last_tint_step in a take. Setup mode brings the shot to Ready. Take mode holds what recording
 started with (start_take), slowly enough that a viewer never sees a change, and never asks.
 The Rig applies the moves and the Director owns the history.
 """
@@ -47,6 +47,9 @@ TAKE_TICK_SECONDS = 1.0  # the take interval, used when there was no previous ti
 MAX_TICK_SECONDS = 1.0
 CONFIRM_SECONDS = 3.0  # a camera value off what the director wrote this soon after it wrote is lag, not a hand
 STEP = 1 / 3  # stops in one camera step
+# Stops past STEP a step may span: nominal values are rounded (f/11 to f/13 reads 0.48 stop, is 1/3).
+# Anything wider (f/1.8 to f/2.8, ISO 6400 to 3200, 1/30 to 1/50) is off the ladder.
+STEP_SLACK = 0.2
 METER_STANDS_IN = 1 / 3  # stops the camera's meter must move before it speaks for a window it cannot see
 ISO_STEPS = [100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200]
 TAKE_DARKEST_APERTURE = 22.0
@@ -181,6 +184,10 @@ def start_take(scene: Scene, history: History) -> None:
     history.snapshot = (scene.level, scene.cb, scene.cr)
     history.snapshot_meter = scene.camera.get("meter")
     history.hands_off = False
+    # A take reads the gain but never learns it: capped at 1/6 stop a second it can hardly overshoot,
+    # so a sign flip there is the subject moving. Each take, and the setup after it, starts fresh.
+    history.gain = 1.0
+    history.last_stops = None
     for setting in EXPOSURE_SETTINGS:
         value = canonical(setting, scene.camera.get(setting))
         if value is None:
@@ -275,6 +282,9 @@ def _setup(scene: Scene, rig: RigState, goal: Goal, history: History) -> Moves:
     ask = None
     if abs(stops) > STOP_TOLERANCE:
         new_brightness = min(100.0, max(MIN_BRIGHTNESS, brightness * 2 ** (stops * history.gain)))
+        if round(new_brightness, 1) == round(brightness, 1):
+            # A small gain can round the step away; the key still moves its smallest step toward the face.
+            new_brightness = min(100.0, max(MIN_BRIGHTNESS, brightness + (0.1 if stops > 0 else -0.1)))
         if (stops > 0 and brightness >= 100.0) or (stops < 0 and brightness <= MIN_BRIGHTNESS):
             distance = goal.geometry.distance_ft
             if stops > 0:
@@ -326,9 +336,11 @@ def _darkness(setting: str, value: Any) -> float | None:
     return 2 * math.log2(number) if setting == "aperture" else -math.log2(number)
 
 
-def _next_step(scene: Scene, goal: Goal, darker: bool) -> CameraMove | None:
-    """One 1/3 step toward darker or brighter, in the order aperture, ISO, shutter."""
+def _next_step(scene: Scene, goal: Goal, darker: bool) -> tuple[CameraMove | None, bool]:
+    """One 1/3 step toward darker or brighter, in the order aperture, ISO, shutter, and whether a
+    setting was passed over because its next rung is more than a step away (off the ladder)."""
 
+    off_ladder = False
     for setting in EXPOSURE_SETTINGS:
         current = _darkness(setting, scene.camera.get(setting))
         if current is None:
@@ -339,9 +351,13 @@ def _next_step(scene: Scene, goal: Goal, darker: bool) -> CameraMove | None:
             steps = [v for v in ladder if _darkness(setting, v) > current + 0.05]
         else:
             steps = [v for v in reversed(ladder) if _darkness(setting, v) < current - 0.05]
-        if steps:
-            return CameraMove(setting, steps[0])
-    return None
+        if not steps:
+            continue
+        if abs(_darkness(setting, steps[0]) - current) > STEP + STEP_SLACK:
+            off_ladder = True  # e.g. f/1.8 on the way to f/2.8: a jump a viewer would see
+            continue
+        return CameraMove(setting, steps[0]), off_ladder
+    return None, off_ladder
 
 
 def _window_stops(scene: Scene, goal: Goal, history: History, face_level: float) -> float:
@@ -370,7 +386,6 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
     # The face: back toward its level at record start, at most BRIGHTNESS_STOPS_PER_SECOND.
     brightness = float(rig.brightness if rig.brightness is not None else 50.0)
     stops = meter.stops_off(scene.level, level0, goal.profile)
-    _learn_gain(stops, history)
     face_stops = 0.0
     held = None
     if abs(stops) > STOP_TOLERANCE:
@@ -411,10 +426,10 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
         if history.hands_off:
             held = "camera changed by hand"
         elif now - history.last_camera_step >= CAMERA_STEP_SECONDS:
-            step = _next_step(scene, goal, darker)
+            step, off_ladder = _next_step(scene, goal, darker)
             paired = new_brightness * 2 ** (STEP if darker else -STEP)
             if step is None:
-                held = f"{what}; nothing left to step"
+                held = f"{what}; off the ladder" if off_ladder else f"{what}; nothing left to step"
             elif paired > 100.0:
                 held = f"{what}; the light is at full"
             elif paired < MIN_BRIGHTNESS:
