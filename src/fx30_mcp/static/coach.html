@@ -41,7 +41,13 @@
   #ended h1 { font-size: clamp(44px, 9vw, 80px); line-height: 1.1; margin: 0 0 24px; }
   #ended p { font-size: clamp(30px, 5vw, 44px); line-height: 1.25; margin: 0; color: #ffb347; }
   #ended, #report { min-height: 100vh; background: #111; color: #fff; padding: 24px 20px; display: flex; flex-direction: column; justify-content: center; text-align: center; }
-  #thumb { position: absolute; top: 12px; right: 12px; width: 120px; border: 2px solid #777; border-radius: 6px; background: #333; }
+  #thumb { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 10px; background: #333; margin: 0 0 14px; }
+  #coach.has-preview { padding-top: 12px; }
+  #coach.has-preview #instruction { font-size: clamp(40px, 9vw, 64px); margin-top: 4px; }
+  #coach.has-preview #detail { font-size: clamp(28px, 6vw, 36px); margin-top: 10px; }
+  #coach.has-preview #lights { padding: 16px 0; }
+  #coach.has-preview .lamp { width: 84px; height: 84px; }
+  #coach.has-preview.take .lamp { width: 96px; height: 96px; }
   .notes { font-size: 16px; color: #4a4843; }
 </style>
 </head>
@@ -182,15 +188,30 @@ function showPlan(s) {
   $("plan-note").textContent = plan.note || "";
 }
 
-let thumbTimer = null;
-function stopThumb() {
-  clearInterval(thumbTimer); thumbTimer = null;
+// Live preview: one frame at a time. The next request waits for the last to load or fail.
+let previewOn = false, previewTimer = null;
+function setPreview(visible) {
+  $("thumb").hidden = !visible;
+  $("coach").classList.toggle("has-preview", visible);
 }
-function refreshThumb() {
-  const img = $("thumb");
-  img.onload = () => { img.hidden = false; };
-  img.onerror = () => { img.hidden = true; };
+function nextFrame() {
+  if (!previewOn) return;
+  const img = new Image();
+  const again = (ok) => {
+    if (!previewOn) return;
+    if (ok) { $("thumb").src = img.src; setPreview(true); } else setPreview(false);
+    previewTimer = setTimeout(nextFrame, 1000);
+  };
+  img.onload = () => again(true);
+  img.onerror = () => again(false);
   img.src = "/frame.jpg?t=" + Date.now();
+}
+function startThumb() {
+  if (previewOn) return;
+  previewOn = true; nextFrame();
+}
+function stopThumb() {
+  previewOn = false; clearTimeout(previewTimer); previewTimer = null;
 }
 
 function showCoach(s) {
@@ -209,7 +230,7 @@ function showCoach(s) {
     el.querySelector(".lamp").className = "lamp " + (colour || "");
     el.setAttribute("aria-label", colour ? `${el.dataset.light}: ${colour}` : "");
   }
-  if (!thumbTimer) { refreshThumb(); thumbTimer = setInterval(refreshThumb, 1000); }
+  startThumb();
 }
 
 function showReport(s) {
@@ -225,19 +246,36 @@ function show(s) {
   else showCoach(s);
 }
 
-// A stale page: the stream keeps failing, or the server says the link is no longer good.
-let ended = false, failures = 0;
+// A stale page: the stream keeps failing while the phone is in use, or the server says the link is no longer good.
+// A locked phone or a wifi drop while the page is hidden is not an ending.
+let ended = false, failures = 0, events = null;
 function end() {
-  ended = true; stopThumb(); events.close(); only("ended");
+  ended = true; stopThumb(); if (events) events.close(); only("ended");
 }
-const events = new EventSource("/events");
-events.onopen = () => { failures = 0; };
-events.onmessage = (e) => { failures = 0; show(JSON.parse(e.data)); };
-events.onerror = () => {
-  failures += 1;
-  if (failures >= 3) { end(); return; }
-  fetch("/frame.jpg", { cache: "no-store" }).then((r) => { if (r.status === 403) end(); }).catch(() => {});
-};
+function connect() {
+  if (events) events.close();
+  events = new EventSource("/events");
+  events.onopen = () => { failures = 0; };
+  events.onmessage = (e) => { failures = 0; show(JSON.parse(e.data)); };
+  events.onerror = () => {
+    if (document.visibilityState !== "visible") return;
+    failures += 1;
+    if (failures >= 3) { end(); return; }
+    probe(false);
+  };
+}
+// A 403 means the link is dead; anything else is a blip (and reopens the stream if it was closed).
+function probe(reopen) {
+  fetch("/frame.jpg", { cache: "no-store" }).then((r) => {
+    if (r.status === 403) end(); else if (reopen && !ended) connect();
+  }).catch(() => { if (reopen && !ended) connect(); });
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || ended) return;
+  failures = 0;
+  if (!events || events.readyState === 2) probe(true);
+});
+connect();
 </script>
 </body>
 </html>

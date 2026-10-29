@@ -206,3 +206,19 @@ def test_page_says_ended_on_a_dead_stream():
     assert "This session has ended" in body
     assert "Open the newest link Claude sent." in body
     assert "events.onerror" in body
+
+
+def test_page_has_a_full_width_live_preview():
+    body = page_body()
+    assert "#thumb" in body and "aspect-ratio: 16 / 9" in body
+    assert "/frame.jpg?t=" in body
+    assert "img.onload" in body and "img.onerror" in body
+    assert "position: absolute" not in body
+
+
+def test_page_ignores_errors_while_hidden_and_rechecks_on_return():
+    body = page_body()
+    assert 'document.visibilityState !== "visible"' in body
+    assert 'addEventListener("visibilitychange"' in body
+    assert "failures = 0" in body and "readyState === 2" in body
+    assert "r.status === 403" in body
