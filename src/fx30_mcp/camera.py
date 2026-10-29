@@ -108,6 +108,22 @@ class CameraBase:
     async def close(self) -> None: ...
 
 
+def choose_camera(found: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """The FX30 among the (name, port) pairs gphoto2 lists: a Sony by name if there is
+    one, else the first that is not an Apple device. gphoto2 has no FX30 entry and lists
+    it as "USB PTP Class Camera"; an iPhone plugged in to charge is listed too, and
+    gp.Camera() on its own would open whichever came first."""
+
+    sony = [entry for entry in found if "sony" in entry[0].lower()]
+    rest = [entry for entry in found if not entry[0].lower().startswith("apple")]
+    return (sony or rest or [None])[0]
+
+
+def no_fx30_message(others: list[str]) -> str:
+    seen = f" (it sees only: {', '.join(others)})" if others else ""
+    return f"The FX30 is not on USB{seen}. Turn the camera on. {PC_REMOTE_HINT}"
+
+
 def _wedged_codes(gp) -> tuple[int, ...]:
     """The gphoto2 errors after which the session is no good and is let go."""
 
@@ -192,7 +208,9 @@ class GPhotoCamera(CameraBase):
         # What ptpcamerad holding the camera looks like: refused outright, or
         # half shared, so commands time out.
         SHARED_ERRORS = (gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_TIMEOUT, gp.GP_ERROR_IO, gp.GP_ERROR_IO_USB_FIND)
-        camera = gp.Camera()
+        camera, others = self._fx30(gp)
+        if camera is None:
+            raise CameraError(no_fx30_message(others))
         try:
             camera.init()
             camera.get_single_config("cameramodel")
@@ -206,8 +224,10 @@ class GPhotoCamera(CameraBase):
             while True:
                 subprocess.run(["killall", "-9", "ptpcamerad"], capture_output=True)
                 time.sleep(0.5)
-                camera = gp.Camera()
+                camera, _ = self._fx30(gp)
                 try:
+                    if camera is None:
+                        raise gp.GPhoto2Error(gp.GP_ERROR_MODEL_NOT_FOUND)
                     camera.init()
                     break
                 except gp.GPhoto2Error as retry:
@@ -218,6 +238,24 @@ class GPhotoCamera(CameraBase):
         except gp.GPhoto2Error:
             self.name = camera.get_abilities().model
         return camera
+
+    @staticmethod
+    def _fx30(gp):
+        """A camera bound to the FX30 on USB, or None and the names of the cameras found."""
+
+        listed = gp.Camera.autodetect()
+        found = [(listed.get_name(i), listed.get_value(i)) for i in range(listed.count())]
+        pick = choose_camera(found)
+        if pick is None:
+            return None, [name for name, _ in found]
+        abilities = gp.CameraAbilitiesList()
+        abilities.load()
+        ports = gp.PortInfoList()
+        ports.load()
+        camera = gp.Camera()
+        camera.set_abilities(abilities[abilities.lookup_model(pick[0])])
+        camera.set_port_info(ports[ports.lookup_path(pick[1])])
+        return camera, []
 
     async def _drop(self) -> None:
         if self._camera is not None:
