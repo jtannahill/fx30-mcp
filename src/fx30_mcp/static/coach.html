@@ -189,29 +189,35 @@ function showPlan(s) {
 }
 
 // Live preview: one frame at a time. The next request waits for the last to load or fail.
-let previewOn = false, previewTimer = null;
+let previewOn = false, previewTimer = null, previewGen = 0, inflight = null;
 function setPreview(visible) {
   $("thumb").hidden = !visible;
   $("coach").classList.toggle("has-preview", visible);
 }
-function nextFrame() {
-  if (!previewOn) return;
+function nextFrame(gen) {
+  if (gen !== previewGen) return;
   const img = new Image();
+  inflight = img;
   const again = (ok) => {
-    if (!previewOn) return;
+    if (gen !== previewGen) return;
     if (ok) { $("thumb").src = img.src; setPreview(true); } else setPreview(false);
-    previewTimer = setTimeout(nextFrame, 1000);
+    previewTimer = setTimeout(() => nextFrame(gen), 1000);
   };
   img.onload = () => again(true);
   img.onerror = () => again(false);
   img.src = "/frame.jpg?t=" + Date.now();
 }
+// previewGen changes on every start and stop, so a stale chain can never schedule another frame.
 function startThumb() {
   if (previewOn) return;
-  previewOn = true; nextFrame();
+  previewOn = true;
+  const gen = ++previewGen;
+  if (document.visibilityState === "visible") nextFrame(gen);
 }
 function stopThumb() {
-  previewOn = false; clearTimeout(previewTimer); previewTimer = null;
+  previewOn = false; previewGen += 1;
+  clearTimeout(previewTimer); previewTimer = null;
+  if (inflight) { inflight.onload = null; inflight.onerror = null; inflight = null; }
 }
 
 function showCoach(s) {
@@ -261,18 +267,23 @@ function connect() {
     if (document.visibilityState !== "visible") return;
     failures += 1;
     if (failures >= 3) { end(); return; }
-    probe(false);
+    probe(events.readyState === 2);
   };
 }
 // A 403 means the link is dead; anything else is a blip (and reopens the stream if it was closed).
 function probe(reopen) {
   fetch("/frame.jpg", { cache: "no-store" }).then((r) => {
-    if (r.status === 403) end(); else if (reopen && !ended) connect();
+    if (r.status === 403) end(); else if (reopen && !ended && (!events || events.readyState === 2)) connect();
   }).catch(() => { if (reopen && !ended) connect(); });
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible" || ended) return;
+  if (ended) return;
+  if (document.visibilityState !== "visible") {
+    clearTimeout(previewTimer); previewTimer = null; previewGen += 1; // pause the frame loop while hidden
+    return;
+  }
   failures = 0;
+  if (previewOn) nextFrame(++previewGen);
   if (!events || events.readyState === 2) probe(true);
 });
 connect();

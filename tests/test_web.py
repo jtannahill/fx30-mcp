@@ -220,5 +220,15 @@ def test_page_ignores_errors_while_hidden_and_rechecks_on_return():
     body = page_body()
     assert 'document.visibilityState !== "visible"' in body
     assert 'addEventListener("visibilitychange"' in body
-    assert "failures = 0" in body and "readyState === 2" in body
+    assert 'if (ended) return;\n  if (document.visibilityState !== "visible")' in body
+    assert "  failures = 0;\n  if (previewOn) nextFrame(++previewGen);" in body
+    assert "probe(events.readyState === 2)" in body
+    assert "reopen && !ended && (!events || events.readyState === 2)" in body
     assert "r.status === 403" in body
+
+
+def test_page_frame_loop_cannot_duplicate():
+    body = page_body()
+    assert "const gen = ++previewGen" in body
+    assert "if (gen !== previewGen) return;" in body
+    assert "inflight.onload = null" in body and "inflight.onerror = null" in body
