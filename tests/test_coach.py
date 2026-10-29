@@ -822,9 +822,9 @@ def test_a_slow_light_says_connecting_then_carries_on(monkeypatch):
     key.set_white = slow_first
     walk(coach, when(coach, at("place_key"), coach.light_in_place))
     shown = [(s["instruction"], s["detail"]) for s in states]
-    i = shown.index(("Connecting to the light", "This can take up to a minute."))
+    i = shown.index(("Connecting to the light", "This can take up to two minutes."))
     assert states[i + 1] == states[i - 1]  # back to what it showed before
-    assert shown.count(("Connecting to the light", "This can take up to a minute.")) == 1
+    assert shown.count(("Connecting to the light", "This can take up to two minutes.")) == 1
     assert states[-1]["step"] == "ready"
 
 

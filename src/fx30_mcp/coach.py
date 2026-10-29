@@ -49,7 +49,7 @@ NO_FACE = ("Sit in the shot", "The coach needs your face in the frame to plan.")
 WORKING_PERCENT = 50  # the key's level for the key check when no percent was predicted
 RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
 SLOW_LIGHT = 3.0  # seconds before a light call is said to be connecting
-CONNECTING = ("Connecting to the light", "This can take up to a minute.")
+CONNECTING = ("Connecting to the light", "This can take up to two minutes.")
 UNREACHABLE = (
     "The light isn't answering",
     "If the amaran or Sidus Link app is open on your phone, close it or turn off the phone's Bluetooth, "
