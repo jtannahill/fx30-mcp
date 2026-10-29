@@ -23,6 +23,7 @@ from . import config, meter
 from .balance import MIN_BRIGHTNESS, STOP_TOLERANCE, balance
 from .camera import CameraBase, CameraError
 from .config import Settings
+from .rig import SLOW_LIGHT, GuardedLight as _Light, LightError, LightUnreachable, _unreachable  # noqa: F401
 from .plan import (
     MIN_KEY_FT,
     UNEVEN_STOPS,
@@ -48,70 +49,12 @@ HOLD_STILL = ("Hold still", "Setting the lights. About 5 seconds.")
 NO_FACE = ("Sit in the shot", "The coach needs your face in the frame to plan.")
 WORKING_PERCENT = 50  # the key's level for the key check when no percent was predicted
 RECORDING = ("Camera is recording", "The coach stopped so it does not read the camera during a take.")
-SLOW_LIGHT = 3.0  # seconds before a light call is said to be connecting
 CONNECTING = ("Connecting to the light", "This can take up to two minutes.")
 UNREACHABLE = (
     "The light isn't answering",
     "If the amaran or Sidus Link app is open on your phone, close it or turn off the phone's Bluetooth, "
     "then start the coach again.",
 )
-
-
-class LightError(Exception):
-    """A light stopped answering: amaran Desktop closed, Bluetooth dropped, a bad reply."""
-
-
-class LightUnreachable(LightError):
-    """The light could not be reached over Bluetooth, most often because a phone app holds its one connection."""
-
-
-def _unreachable(err: Exception) -> bool:
-    try:
-        from amaran_mcp.link import LinkError
-    except ImportError:
-        LinkError = ()  # noqa: N806
-    text = str(err).lower()
-    return isinstance(err, LinkError) or "could not connect" in text or "not advertising" in text
-
-
-class _Light:
-    """A light whose failures come out as LightError, so they are told apart from the coach's own.
-
-    A call still waiting after SLOW_LIGHT seconds is connecting: slow() is called then, and back()
-    once it returns."""
-
-    def __init__(self, light: Any, slow: Callable[[], None], back: Callable[[], None]) -> None:
-        self._light = light
-        self._slow = slow
-        self._back = back
-
-    def __getattr__(self, name: str) -> Any:
-        value = getattr(self._light, name)
-        if not inspect.iscoroutinefunction(value):
-            return value
-
-        async def call(*args: Any, **kwargs: Any) -> Any:
-            fired: list[bool] = []
-
-            def slow() -> None:
-                fired.append(True)
-                self._slow()
-
-            timer = asyncio.get_running_loop().call_later(SLOW_LIGHT, slow)
-            try:
-                result = await value(*args, **kwargs)
-            except CameraError:
-                raise
-            except Exception as err:
-                kind = LightUnreachable if _unreachable(err) else LightError
-                raise kind(str(err) or type(err).__name__) from err
-            finally:
-                timer.cancel()
-            if fired:
-                self._back()
-            return result
-
-        return call
 
 
 class _Stopped(Exception):

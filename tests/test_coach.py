@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from fx30_mcp import coach as coach_module
+from fx30_mcp import rig as rig_module
 from fx30_mcp import config, meter
 from fx30_mcp.camera import WEDGED_HINT, CameraError
 from fx30_mcp.coach import Coach
@@ -807,7 +808,7 @@ UNREACHABLE = (
 
 
 def test_a_slow_light_says_connecting_then_carries_on(monkeypatch):
-    monkeypatch.setattr(coach_module, "SLOW_LIGHT", 0.01)
+    monkeypatch.setattr(rig_module, "SLOW_LIGHT", 0.01)
     camera, key = sim()
     coach, states = coach_for(camera, key)
     real = key.set_white
