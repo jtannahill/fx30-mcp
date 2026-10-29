@@ -13,8 +13,6 @@
   * { box-sizing: border-box; }
   body { margin: 0; font: 18px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; background: var(--paper); color: var(--ink); }
   [hidden] { display: none !important; }
-  button { font: inherit; cursor: pointer; border: 0; border-radius: 14px; }
-  button:focus-visible { outline: 4px solid #1f5a94; outline-offset: 3px; }
 
   /* Plan screen */
   #plan { max-width: 980px; margin: 0 auto; padding: 20px; }
@@ -25,7 +23,6 @@
   .side { flex: 1 1 280px; min-width: 260px; }
   .label { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: #4a4843; margin-top: 14px; }
   .side p { margin: 4px 0; }
-  #start { margin-top: 20px; width: 100%; padding: 20px; font-size: 26px; font-weight: 700; background: #1c1b19; color: #fff; }
 
   /* Coach screen, layout B: big type on dark */
   #coach { min-height: 100vh; background: #111; color: #fff; padding: 24px 20px 28px; display: flex; flex-direction: column; text-align: center; position: relative; }
@@ -36,7 +33,14 @@
   .lamp { width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 10px; background: #555; }
   .lamp.green { background: var(--green); } .lamp.amber { background: var(--amber); } .lamp.red { background: var(--red); }
   .light span { font-size: 24px; color: #d0d0d0; }
-  #tap { width: 100%; padding: 28px; font-size: 36px; font-weight: 700; background: #fff; color: #111; }
+  #banner { font-size: 20px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #ff8a84; margin: 0; }
+  #coach.take #lights { gap: clamp(16px, 5vw, 56px); }
+  #coach.take .lamp { width: 104px; height: 104px; }
+  #coach.take .light span { font-size: 32px; color: #fff; }
+  #report-text { font-size: clamp(36px, 7vw, 64px); font-weight: 700; line-height: 1.2; margin: auto 0; }
+  #ended h1 { font-size: clamp(44px, 9vw, 80px); line-height: 1.1; margin: 0 0 24px; }
+  #ended p { font-size: clamp(30px, 5vw, 44px); line-height: 1.25; margin: 0; color: #ffb347; }
+  #ended, #report { min-height: 100vh; background: #111; color: #fff; padding: 24px 20px; display: flex; flex-direction: column; justify-content: center; text-align: center; }
   #thumb { position: absolute; top: 12px; right: 12px; width: 120px; border: 2px solid #777; border-radius: 6px; background: #333; }
   .notes { font-size: 16px; color: #4a4843; }
 </style>
@@ -60,11 +64,11 @@
       <p class="notes" id="plan-note"></p>
     </div>
   </div>
-  <button id="start" type="button">Start</button>
 </main>
 
 <main id="coach" hidden>
   <img id="thumb" alt="Live view from the camera" hidden>
+  <p id="banner" hidden>Recording</p>
   <h1 id="instruction"></h1>
   <p id="detail"></p>
   <div id="lights">
@@ -72,7 +76,15 @@
     <div class="light" data-light="window"><div class="lamp"></div><span>Window</span></div>
     <div class="light" data-light="ratio"><div class="lamp"></div><span>Ratio</span></div>
   </div>
-  <button id="tap" type="button"></button>
+</main>
+
+<main id="report" hidden>
+  <p id="report-text"></p>
+</main>
+
+<main id="ended" hidden>
+  <h1>This session has ended</h1>
+  <p>Open the newest link Claude sent.</p>
 </main>
 
 <script>
@@ -146,13 +158,17 @@ function drawSide(plan) {
   svg(root, "text", { x: 76, y: 30, "font-size": 12, fill: "#8a4f05" }, `${fmtFt(g.height_ft)} above eyes, aimed down`);
 }
 
+function only(name) {
+  for (const id of ["plan", "coach", "report", "ended"]) $(id).hidden = id !== name;
+}
+
 function showPlan(s) {
   stopThumb();
-  $("plan").hidden = false; $("coach").hidden = true;
+  only("plan");
   $("plan-title").textContent = s.instruction;
   $("plan-detail").textContent = s.detail || "";
   const plan = s.plan;
-  $("plan-body").hidden = !plan; $("start").hidden = !plan;
+  $("plan-body").hidden = !plan;
   if (!plan) return;
   drawTop(plan, !!(s.lights && s.lights.window));
   drawSide(plan);
@@ -178,7 +194,12 @@ function refreshThumb() {
 }
 
 function showCoach(s) {
-  $("plan").hidden = true; $("coach").hidden = false;
+  only("coach");
+  const take = s.screen === "take";
+  $("coach").classList.toggle("take", take);
+  $("banner").hidden = !take;
+  // On the take screen the instruction slot says "Recording" (the banner does); only a held reason shows.
+  $("instruction").hidden = take;
   $("instruction").textContent = s.instruction;
   $("detail").textContent = s.detail || "";
   $("detail").hidden = !s.detail;
@@ -188,25 +209,35 @@ function showCoach(s) {
     el.querySelector(".lamp").className = "lamp " + (colour || "");
     el.setAttribute("aria-label", colour ? `${el.dataset.light}: ${colour}` : "");
   }
-  const tap = $("tap");
-  const asks = ["camera", "place_key", "balance"].includes(s.step);
-  tap.hidden = !asks;
-  tap.textContent = s.step === "place_key" ? "Light is in place" : "Done";
   if (!thumbTimer) { refreshThumb(); thumbTimer = setInterval(refreshThumb, 1000); }
 }
 
+function showReport(s) {
+  stopThumb();
+  only("report");
+  $("report-text").textContent = (s.report && s.report.text) || s.instruction;
+}
+
 function show(s) {
-  if (s.screen === "plan") showPlan(s); else showCoach(s);
+  if (ended) return;
+  if (s.screen === "plan") showPlan(s);
+  else if (s.screen === "report") showReport(s);
+  else showCoach(s);
 }
 
-function post(path) {
-  return fetch(path, { method: "POST" }).catch(() => {});
+// A stale page: the stream keeps failing, or the server says the link is no longer good.
+let ended = false, failures = 0;
+function end() {
+  ended = true; stopThumb(); events.close(); only("ended");
 }
-$("start").addEventListener("click", () => post("/begin"));
-$("tap").addEventListener("click", () => post("/in-place"));
-
 const events = new EventSource("/events");
-events.onmessage = (e) => show(JSON.parse(e.data));
+events.onopen = () => { failures = 0; };
+events.onmessage = (e) => { failures = 0; show(JSON.parse(e.data)); };
+events.onerror = () => {
+  failures += 1;
+  if (failures >= 3) { end(); return; }
+  fetch("/frame.jpg", { cache: "no-store" }).then((r) => { if (r.status === 403) end(); }).catch(() => {});
+};
 </script>
 </body>
 </html>

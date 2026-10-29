@@ -187,3 +187,22 @@ def test_the_page_leaves_signal_handling_to_the_process():
             await handle.close()
 
     asyncio.run(go())
+
+
+def page_body() -> str:
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster))
+    return client.get("/?key=k").text
+
+
+def test_page_has_no_buttons():
+    body = page_body()
+    assert "<button" not in body
+    assert "/begin" not in body and "/in-place" not in body
+
+
+def test_page_says_ended_on_a_dead_stream():
+    body = page_body()
+    assert "This session has ended" in body
+    assert "Open the newest link Claude sent." in body
+    assert "events.onerror" in body
