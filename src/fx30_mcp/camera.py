@@ -209,22 +209,23 @@ class GPhotoCamera(CameraBase):
         # half shared, so commands time out.
         SHARED_ERRORS = (gp.GP_ERROR_IO_USB_CLAIM, gp.GP_ERROR_TIMEOUT, gp.GP_ERROR_IO, gp.GP_ERROR_IO_USB_FIND)
         camera, others = self._fx30(gp)
-        if camera is None:
-            raise CameraError(no_fx30_message(others))
         try:
+            if camera is None:
+                raise gp.GPhoto2Error(gp.GP_ERROR_MODEL_NOT_FOUND)
             camera.init()
             camera.get_single_config("cameramodel")
         except gp.GPhoto2Error as err:
-            if err.code not in SHARED_ERRORS:
+            if err.code not in SHARED_ERRORS + (gp.GP_ERROR_MODEL_NOT_FOUND,):
                 raise
             # macOS's ptpcamerad claims every camera that is plugged in. launchd
             # restarts it, but not before the camera is ours. The camera drops off
-            # USB for a moment when it lets go, so keep trying for a few seconds.
+            # USB for a moment when it lets go, and sometimes on the first open after
+            # a while (Oct 29), so keep trying for a few seconds.
             deadline = time.monotonic() + 8
             while True:
                 subprocess.run(["killall", "-9", "ptpcamerad"], capture_output=True)
                 time.sleep(0.5)
-                camera, _ = self._fx30(gp)
+                camera, others = self._fx30(gp)
                 try:
                     if camera is None:
                         raise gp.GPhoto2Error(gp.GP_ERROR_MODEL_NOT_FOUND)
@@ -232,6 +233,8 @@ class GPhotoCamera(CameraBase):
                     break
                 except gp.GPhoto2Error as retry:
                     if time.monotonic() > deadline or retry.code not in SHARED_ERRORS + (gp.GP_ERROR_MODEL_NOT_FOUND,):
+                        if camera is None:
+                            raise CameraError(no_fx30_message(others)) from retry
                         raise
         try:
             self.name = camera.get_single_config("cameramodel").get_value()

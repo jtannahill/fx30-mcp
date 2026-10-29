@@ -3,6 +3,7 @@ import types
 
 import pytest
 
+from fx30_mcp import camera as camera_module
 from fx30_mcp.camera import CameraError, GPhotoCamera, choose_camera
 
 
@@ -40,10 +41,83 @@ def test_opening_with_only_an_iphone_says_the_fx30_is_missing(monkeypatch):
         def init(self):
             raise AssertionError("the iPhone must not be opened")
 
+    class GPhoto2Error(Exception):
+        def __init__(self, code):
+            self.code = code
+
     fake = types.SimpleNamespace(
-        Camera=Camera, GPhoto2Error=Exception, GP_ERROR_IO_USB_CLAIM=-53, GP_ERROR_TIMEOUT=-10,
+        Camera=Camera, GPhoto2Error=GPhoto2Error, GP_ERROR_IO_USB_CLAIM=-53, GP_ERROR_TIMEOUT=-10,
         GP_ERROR_IO=-7, GP_ERROR_IO_USB_FIND=-52, GP_ERROR_MODEL_NOT_FOUND=-105,
     )
     monkeypatch.setitem(sys.modules, "gphoto2", fake)
+    monkeypatch.setattr(camera_module.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(camera_module.time, "sleep", lambda s: None)
+    clock = iter(range(0, 1000, 3))  # each look at the clock is 3 s on
+    monkeypatch.setattr(camera_module.time, "monotonic", lambda: next(clock))
     with pytest.raises(CameraError, match="not on USB .*Apple iPhone"):
         GPhotoCamera()._open()
+
+
+def test_a_camera_that_drops_off_usb_for_a_moment_is_opened_on_a_retry(monkeypatch):
+    lists = iter([[], [], [("USB PTP Class Camera", "usb:001,001")]])
+    opened = []
+
+    class Listed:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def count(self):
+            return len(self.entries)
+
+        def get_name(self, i):
+            return self.entries[i][0]
+
+        def get_value(self, i):
+            return self.entries[i][1]
+
+    class Widget:
+        def get_value(self):
+            return "ILME-FX30"
+
+    class Camera:
+        @staticmethod
+        def autodetect():
+            return Listed(next(lists))
+
+        def set_abilities(self, a):
+            pass
+
+        def set_port_info(self, p):
+            pass
+
+        def init(self):
+            opened.append(True)
+
+        def get_single_config(self, name):
+            return Widget()
+
+    class Lookup(list):
+        def load(self):
+            pass
+
+        def lookup_model(self, name):
+            return 0
+
+        def lookup_path(self, port):
+            return 0
+
+    class GPhoto2Error(Exception):
+        def __init__(self, code):
+            self.code = code
+
+    fake = types.SimpleNamespace(
+        Camera=Camera, GPhoto2Error=GPhoto2Error, GP_ERROR_IO_USB_CLAIM=-53, GP_ERROR_TIMEOUT=-10,
+        GP_ERROR_IO=-7, GP_ERROR_IO_USB_FIND=-52, GP_ERROR_MODEL_NOT_FOUND=-105,
+        CameraAbilitiesList=lambda: Lookup([None]), PortInfoList=lambda: Lookup([None]),
+    )
+    monkeypatch.setitem(sys.modules, "gphoto2", fake)
+    monkeypatch.setattr(camera_module.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(camera_module.time, "sleep", lambda s: None)
+    camera = GPhotoCamera()
+    camera._open()
+    assert opened == [True] and camera.name == "ILME-FX30"
