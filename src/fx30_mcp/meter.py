@@ -81,6 +81,8 @@ class Reading:
     hue: float | None  # skin hue on the vectorscope in degrees, None when too grey to read
     chroma: float
     sides: tuple[float, float] = (0.0, 0.0)  # median luma of the left and right halves
+    cb: float = 0.0  # skin chroma on the vectorscope, blue-yellow axis
+    cr: float = 0.0  # skin chroma on the vectorscope, red-cyan axis
 
     @property
     def lit(self) -> float:
@@ -106,15 +108,18 @@ class Reading:
         out = asdict(self)
         out["box"] = [round(v, 3) for v in self.box]
         out["sides"] = [round(v, 3) for v in self.sides]
-        for key in ("level", "clipped", "chroma"):
+        for key in ("level", "clipped", "chroma", "cb", "cr"):
             out[key] = round(out[key], 3)
         if self.hue is not None:
             out["hue"] = round(self.hue, 1)
         return out
 
 
-def find_face(jpeg: bytes) -> Box | None:
-    """The largest face Apple Vision finds, or None."""
+def detect(jpeg: bytes) -> tuple[Box, float | None] | None:
+    """One Vision request (face rectangles, revision 3): the largest face's box and
+    yaw in degrees, or None without a face. Positive yaw means the nose points to
+    frame-right, so the far cheek is on frame-left. The sign follows Apple's
+    documentation; it is confirmed on hardware in a later task."""
 
     import Vision
     from Foundation import NSData, NSDictionary
@@ -123,16 +128,28 @@ def find_face(jpeg: bytes) -> Box | None:
     # A plain {} does not bridge here; Vision wants a real NSDictionary.
     handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, NSDictionary.dictionary())
     request = Vision.VNDetectFaceRectanglesRequest.alloc().init()
+    revision = getattr(Vision, "VNDetectFaceRectanglesRequestRevision3", None)
+    if revision is not None:
+        request.setRevision_(revision)
     ok, error = handler.performRequests_error_([request], None)
     if not ok:
         raise ValueError(f"live view frame is not a readable image: {error}")
     faces = list(request.results() or [])
     if not faces:
         return None
-    box = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height).boundingBox()
+    face = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height)
+    box = face.boundingBox()
     # Vision measures from the bottom left.
     x, y, w, h = box.origin.x, box.origin.y, box.size.width, box.size.height
-    return (x, 1 - y - h, w, h)
+    yaw = face.yaw()
+    return (x, 1 - y - h, w, h), (None if yaw is None else math.degrees(float(yaw)))
+
+
+def find_face(jpeg: bytes) -> Box | None:
+    """The largest face Apple Vision finds, or None."""
+
+    found = detect(jpeg)
+    return None if found is None else found[0]
 
 
 def _inner(box: Box) -> Box:
@@ -142,16 +159,19 @@ def _inner(box: Box) -> Box:
     return (x + w * 0.2, y + h * 0.15, w * 0.6, h * 0.7)
 
 
-def read(jpeg: bytes, box: Box | None = None) -> Reading:
-    """Meter a frame. Without a box, finds the face; with no face, reads the middle third."""
+def read(image: bytes | np.ndarray, box: Box | None = None) -> Reading:
+    """Meter a frame. Without a box, finds the face; with no face, reads the middle third.
+
+    Decoded pixels (from decode) are metered as given; they carry no JPEG for
+    Vision, so without a box they read the middle third."""
 
     face = box is not None
-    if box is None:
-        box = find_face(jpeg)
+    if box is None and isinstance(image, bytes):
+        box = find_face(image)
         face = box is not None
     if box is None:
         box = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
-    rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"), dtype=float) / 255
+    rgb = decode(image) if isinstance(image, bytes) else image
     height, width, _ = rgb.shape
     x, y, w, h = _inner(box) if face else box
     left, top = int(x * width), int(y * height)
@@ -173,7 +193,7 @@ def read(jpeg: bytes, box: Box | None = None) -> Reading:
     cr = float(np.mean((r[skin] - luma[skin]) * 0.713))
     chroma = math.hypot(cb, cr)
     hue = math.degrees(math.atan2(cr, cb)) % 360 if chroma >= MIN_CHROMA else None
-    return Reading(face, box, float(np.median(luma)), clipped, hue, chroma, sides)
+    return Reading(face, box, float(np.median(luma)), clipped, hue, chroma, sides, cb, cr)
 
 
 def _luma(pixels: np.ndarray) -> np.ndarray:
@@ -189,11 +209,13 @@ class Window:
     blue: float  # mean (b - luma) * 0.564 over the window: positive reads as daylight
 
 
-def _decode(jpeg: bytes) -> np.ndarray:
+def decode(jpeg: bytes) -> np.ndarray:
+    """A JPEG as float RGB, 0..1."""
+
     return np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"), dtype=float) / 255
 
 
-def find_window(jpeg: bytes, face_box: Box | None, profile: str) -> Window | None:
+def find_window(image: bytes | np.ndarray, face_box: Box | None, profile: str) -> Window | None:
     """The bright patch behind the subject, if there is one.
 
     Leaves out the face (widened 1.6x) and everything below it, so skin and
@@ -201,7 +223,7 @@ def find_window(jpeg: bytes, face_box: Box | None, profile: str) -> Window | Non
     light of the wall (the darker quarter of what is left, since a window can
     fill half of the strip beside the head) and at least mid grey."""
 
-    rgb = _decode(jpeg)
+    rgb = decode(image) if isinstance(image, bytes) else image
     height, width, _ = rgb.shape
     linear = np.asarray(PROFILES[profile][0](_luma(rgb.reshape(-1, 3))), dtype=float).reshape(height, width)
     considered = np.ones((height, width), dtype=bool)
@@ -232,29 +254,10 @@ def find_window(jpeg: bytes, face_box: Box | None, profile: str) -> Window | Non
 
 def face_yaw(jpeg: bytes) -> float | None:
     """How far the head is turned, in degrees; positive means the nose points to
-    frame-right, so the far cheek is on frame-left. None without a face.
+    frame-right, so the far cheek is on frame-left. None without a face."""
 
-    Revision 3 of Vision's face rectangles reports yaw. The sign here follows
-    Apple's documentation; it is confirmed on hardware in a later task."""
-
-    import Vision
-    from Foundation import NSData, NSDictionary
-
-    data = NSData.dataWithBytes_length_(jpeg, len(jpeg))
-    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, NSDictionary.dictionary())
-    request = Vision.VNDetectFaceRectanglesRequest.alloc().init()
-    revision = getattr(Vision, "VNDetectFaceRectanglesRequestRevision3", None)
-    if revision is not None:
-        request.setRevision_(revision)
-    ok, error = handler.performRequests_error_([request], None)
-    if not ok:
-        raise ValueError(f"live view frame is not a readable image: {error}")
-    faces = list(request.results() or [])
-    if not faces:
-        return None
-    face = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height)
-    yaw = face.yaw()
-    return None if yaw is None else math.degrees(float(yaw))
+    found = detect(jpeg)
+    return None if found is None else found[1]
 
 
 def key_only(on: bytes, off: bytes, box: Box, profile: str) -> tuple[float, float]:
@@ -262,7 +265,7 @@ def key_only(on: bytes, off: bytes, box: Box, profile: str) -> tuple[float, floa
     the frame with the key on, less the same frame with it off."""
 
     def halves(jpeg: bytes) -> list[float]:
-        rgb = _decode(jpeg)
+        rgb = decode(jpeg)
         height, width, _ = rgb.shape
         x, y, w, h = _inner(box)
         left, top = int(x * width), int(y * height)
@@ -327,7 +330,7 @@ def catchlight(on: bytes, off: bytes, profile: str = "rec709") -> str | None:
     if found is None:
         return None
     face, pupils = found
-    lit, dark = _decode(on), _decode(off)
+    lit, dark = decode(on), decode(off)
     height, width, _ = lit.shape
     half = max(face[2] * width / 6, 0) / 2
     if half * 2 < MIN_EYE_PX or dark.shape != lit.shape:
