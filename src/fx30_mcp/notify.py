@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import time
@@ -56,7 +55,8 @@ def _urllib_post(url: str, data: dict, auth: tuple[str, str]) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
-        return json.loads(response.read() or b"{}")
+        response.read()
+        return {}
 
 
 class NatashaTexts:
@@ -80,8 +80,9 @@ class NatashaTexts:
         env = _read_env(self._env_path)
         sid, token = env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"]
         data = {"To": env["MY_PHONE_NUMBER"], "Body": body}
-        if env.get("TWILIO_MESSAGING_SERVICE_SID"):
-            data["MessagingServiceSid"] = env["TWILIO_MESSAGING_SERVICE_SID"]
+        service = env.get("MESSAGING_SERVICE_SID") or env.get("TWILIO_MESSAGING_SERVICE_SID")
+        if service:
+            data["MessagingServiceSid"] = service
         else:
             data["From"] = env["TWILIO_PHONE_NUMBER"]
         self._post(_URL.format(sid=sid), data, (sid, token))

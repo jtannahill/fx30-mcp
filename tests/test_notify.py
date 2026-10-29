@@ -113,3 +113,19 @@ def test_real_sender_otherwise(monkeypatch):
     monkeypatch.delenv("FX30_BACKEND", raising=False)
     monkeypatch.delenv("FX30_TEXTS", raising=False)
     assert isinstance(notify.texts_for_server()._texts, NatashaTexts)
+
+
+def test_messaging_service_sid_key_is_used(tmp_path):
+    text = ENV.replace("TWILIO_MESSAGING_SERVICE_SID=MGfake", "MESSAGING_SERVICE_SID=MGplain")
+    calls = []
+    texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
+    asyncio.run(texts.send("link", "x"))
+    assert calls[0]["MessagingServiceSid"] == "MGplain"
+
+
+def test_a_repeated_key_takes_its_last_value(tmp_path):
+    text = ENV + "MESSAGING_SERVICE_SID=MGfirst\nMESSAGING_SERVICE_SID=MGlast\n"
+    calls = []
+    texts = NatashaTexts(_env(tmp_path, text), post=lambda u, d, a: calls.append(d) or {})
+    asyncio.run(texts.send("link", "x"))
+    assert calls[0]["MessagingServiceSid"] == "MGlast"
