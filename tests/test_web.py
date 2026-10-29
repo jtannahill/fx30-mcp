@@ -8,30 +8,36 @@ import pytest
 from starlette.testclient import TestClient
 
 from fx30_mcp import meter
-from fx30_mcp.coach import Coach
 from fx30_mcp.config import Settings
+from fx30_mcp.director import Director
+from fx30_mcp.notify import RecordedTexts
+from fx30_mcp.rig import Rig
 from fx30_mcp.sim import SimCamera, SimLight
 from fx30_mcp.web import Broadcaster, make_app, start_web
 
 
-def build() -> tuple[Coach, Broadcaster]:
+def director_for(camera, key, publish, **kwargs) -> Director:
+    rig = Rig(camera, key, on_slow=lambda: None, on_back=lambda: None)
+    return Director(rig, Settings(), publish, RecordedTexts(), **kwargs)
+
+
+def build() -> tuple[Director, Broadcaster]:
     broadcaster = Broadcaster()
     key = SimLight()
-    coach = Coach(SimCamera(key), key, None, Settings(), broadcaster.publish)
-    return coach, broadcaster
+    return director_for(SimCamera(key), key, broadcaster.publish), broadcaster
 
 
 def test_refuses_without_the_key():
-    coach, broadcaster = build()
-    client = TestClient(make_app(coach, "k", broadcaster))
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster))
     assert client.get("/").status_code == 403
     assert client.get("/events").status_code == 403
     assert client.get("/?key=wrong").status_code == 403
 
 
 def test_page_with_key_sets_cookie():
-    coach, broadcaster = build()
-    client = TestClient(make_app(coach, "k", broadcaster))
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster))
     first = client.get("/?key=k")
     assert first.status_code == 200
     assert "fx30_key" in first.cookies
@@ -39,18 +45,18 @@ def test_page_with_key_sets_cookie():
 
 
 def test_frame_is_served_when_there_is_one():
-    coach, broadcaster = build()
-    coach.latest_frame = b"\xff\xd8jpeg"
-    client = TestClient(make_app(coach, "k", broadcaster))
+    director, broadcaster = build()
+    director.latest_frame = b"\xff\xd8jpeg"
+    client = TestClient(make_app(director, "k", broadcaster))
     got = client.get("/frame.jpg?key=k")
     assert got.status_code == 200 and got.content == b"\xff\xd8jpeg"
 
 
 def test_events_start_with_the_current_state():
-    coach, broadcaster = build()
+    director, broadcaster = build()
     state = {"screen": "plan", "step": "camera", "instruction": "Hi", "detail": None, "lights": {}, "plan": None}
     broadcaster.publish(state)
-    client = TestClient(make_app(coach, "k", broadcaster))
+    client = TestClient(make_app(director, "k", broadcaster))
     with client.stream("GET", "/events?key=k") as response:
         first = next(line for line in response.iter_lines() if line.startswith("data:"))
     assert json.loads(first[len("data:"):]) == state
@@ -70,21 +76,17 @@ def test_broadcaster_replays_latest_then_new_states():
     asyncio.run(go())
 
 
-def test_begin_and_in_place_reach_the_coach():
-    coach, broadcaster = build()
-    client = TestClient(make_app(coach, "k", broadcaster))
-    assert client.post("/in-place").status_code == 403
-    assert client.post("/in-place?key=k").status_code == 200
-    assert coach._in_place.is_set()
-    assert not coach._begun.is_set()
-    assert client.post("/begin?key=k").status_code == 200
-    assert coach._begun.is_set()
+def test_begin_and_in_place_are_gone():
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster))
+    assert client.post("/begin?key=k").status_code in (404, 405)
+    assert client.post("/in-place?key=k").status_code in (404, 405)
 
 
 def test_qr_encodes_the_url():
     async def go():
-        coach, broadcaster = build()
-        handle = await start_web(coach, broadcaster)
+        director, broadcaster = build()
+        handle = await start_web(director, broadcaster)
         try:
             assert handle.qr_png.startswith(b"\x89PNG\r\n\x1a\n")
             assert "?key=" in handle.url
@@ -95,8 +97,8 @@ def test_qr_encodes_the_url():
 
 
 def test_stale_cookie_is_replaced_by_the_key_in_the_link():
-    coach, broadcaster = build()
-    client = TestClient(make_app(coach, "k", broadcaster), cookies={"fx30_key": "old"})
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster), cookies={"fx30_key": "old"})
     assert client.get("/frame.jpg").status_code == 403
     first = client.get("/?key=k")
     assert first.status_code == 200
@@ -105,36 +107,35 @@ def test_stale_cookie_is_replaced_by_the_key_in_the_link():
 
 
 def test_every_response_sends_no_referrer():
-    coach, broadcaster = build()
-    client = TestClient(make_app(coach, "k", broadcaster))
+    director, broadcaster = build()
+    client = TestClient(make_app(director, "k", broadcaster))
     assert client.get("/").headers["referrer-policy"] == "no-referrer"
     assert client.get("/?key=k").headers["referrer-policy"] == "no-referrer"
 
 
 def test_page_shows_the_lighting_ratio_and_the_no_fill_case():
-    coach, broadcaster = build()
-    html = TestClient(make_app(coach, "k", broadcaster)).get("/?key=k").text
+    director, broadcaster = build()
+    html = TestClient(make_app(director, "k", broadcaster)).get("/?key=k").text
     assert "No fill light" in html
     assert "fmtRatio(plan.fill_ratio)" in html
     assert "${plan.fill_ratio}:1" not in html
 
 
-def test_published_plan_says_whether_there_is_a_fill(monkeypatch):
+def test_published_plan_says_there_is_no_fill_for_now(monkeypatch):
     monkeypatch.setattr(meter, "find_face", lambda _j: (100 / 320, 40 / 180, 120 / 320, 100 / 180))
     monkeypatch.setattr(meter, "face_yaw", lambda _j: None)
 
     async def no_wait(_seconds):
         pass
 
-    async def has_fill(fill):
+    async def has_fill():
         key = SimLight()
         states = []
-        coach = Coach(SimCamera(key, window=4.0), key, fill, Settings(), states.append, sleep=no_wait)
-        await coach.start()
+        director = director_for(SimCamera(key, window=4.0), key, states.append, sleep=no_wait)
+        await director.start()
         return states[-1]["plan"]["has_fill"]
 
-    assert asyncio.run(has_fill(None)) is False
-    assert asyncio.run(has_fill(SimLight())) is True
+    assert asyncio.run(has_fill()) is False
 
 
 def test_broadcaster_close_ends_open_streams():
@@ -153,9 +154,9 @@ def test_broadcaster_close_ends_open_streams():
 
 def test_close_is_quick_with_an_open_stream(caplog):
     async def go():
-        coach, broadcaster = build()
+        director, broadcaster = build()
         broadcaster.publish({"screen": "plan"})
-        handle = await start_web(coach, broadcaster)
+        handle = await start_web(director, broadcaster)
         port = int(handle.url.split(":")[2].split("/")[0])
         key = handle.url.split("key=")[1]
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -177,8 +178,8 @@ def test_close_is_quick_with_an_open_stream(caplog):
 def test_the_page_leaves_signal_handling_to_the_process():
     async def go():
         before = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
-        coach, broadcaster = build()
-        handle = await start_web(coach, broadcaster)
+        director, broadcaster = build()
+        handle = await start_web(director, broadcaster)
         try:
             await asyncio.sleep(0.05)
             assert {sig: signal.getsignal(sig) for sig in before} == before

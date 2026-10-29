@@ -1,8 +1,9 @@
 """The coach page, served on the local network behind a random key.
 
-Broadcaster carries the coach's states to every open page. make_app builds the
+Broadcaster carries the director's states to every open page. make_app builds the
 routes; start_web runs them with uvicorn in the current event loop and hands
-back the link and a QR code for the phone.
+back the link and a QR code for the phone. The page only watches: the director
+needs no taps.
 """
 
 from __future__ import annotations
@@ -21,10 +22,10 @@ import segno
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .coach import Coach
+from .director import Director
 
 PAGE = Path(__file__).parent / "static" / "coach.html"
 COOKIE = "fx30_key"
@@ -68,7 +69,7 @@ class Broadcaster:
             self._queues.discard(queue)
 
 
-def make_app(coach: Coach, key: str, broadcaster: Broadcaster) -> Starlette:
+def make_app(director: Director, key: str, broadcaster: Broadcaster) -> Starlette:
     def allowed(request: Request) -> bool:
         given = request.query_params.get("key") or request.cookies.get(COOKIE) or ""
         return secrets.compare_digest(given.encode(), key.encode())
@@ -97,25 +98,16 @@ def make_app(coach: Coach, key: str, broadcaster: Broadcaster) -> Starlette:
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
     async def frame(_request: Request) -> Response:
-        if coach.latest_frame is None:
+        frame = director.latest_frame
+        if frame is None:
             return Response(status_code=204)
-        return Response(coach.latest_frame, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-    async def begin(_request: Request) -> Response:
-        coach.begin()
-        return JSONResponse({"ok": True})
-
-    async def in_place(_request: Request) -> Response:
-        coach.light_in_place()
-        return JSONResponse({"ok": True})
+        return Response(frame, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     return Starlette(
         routes=[
             Route("/", guarded(page)),
             Route("/events", guarded(events)),
             Route("/frame.jpg", guarded(frame)),
-            Route("/begin", guarded(begin), methods=["POST"]),
-            Route("/in-place", guarded(in_place), methods=["POST"]),
         ]
     )
 
@@ -153,10 +145,10 @@ def lan_ip() -> str:
         return "127.0.0.1"
 
 
-async def start_web(coach: Coach, broadcaster: Broadcaster, port: int = 0) -> WebHandle:
+async def start_web(director: Director, broadcaster: Broadcaster, port: int = 0) -> WebHandle:
     key = secrets.token_urlsafe(12)
     config = uvicorn.Config(
-        make_app(coach, key, broadcaster),
+        make_app(director, key, broadcaster),
         host="0.0.0.0",
         port=port,
         log_level="warning",

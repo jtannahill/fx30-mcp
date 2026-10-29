@@ -100,10 +100,30 @@ def test_key_that_was_off_is_powered_on():
     assert log == [("key.set_white", 5600, 60.0, 0), ("key.power", True)]
 
 
-def test_unreachable_light_raises_light_unreachable():
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("could not connect to the light"),
+        RuntimeError("Found the light but could not connect ()"),
+        RuntimeError("The light is not advertising over Bluetooth. Is it on?"),
+        "LinkError",
+    ],
+)
+def test_unreachable_light_raises_light_unreachable(error):
+    if error == "LinkError":
+        from amaran_mcp.link import LinkError
+
+        error = LinkError("Lost the Bluetooth link to the light (timeout).")
     log = []
-    key = FakeKey(log, error=RuntimeError("could not connect to the light"))
+    key = FakeKey(log, error=error)
     with pytest.raises(LightUnreachable):
+        asyncio.run(make(log, key=key).apply(MOVES, History()))
+
+
+def test_a_light_error_without_a_message_names_it():
+    log = []
+    key = FakeKey(log, error=ValueError())
+    with pytest.raises(LightError, match="^ValueError$"):
         asyncio.run(make(log, key=key).apply(MOVES, History()))
 
 

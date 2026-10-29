@@ -7,6 +7,7 @@ from fx30_mcp import config, meter
 from fx30_mcp.camera import CameraError
 from fx30_mcp.config import Settings
 from fx30_mcp.director import IDLE_END_SECONDS, Director
+from fx30_mcp.plan import exposure_of
 from fx30_mcp.report import report_text
 from fx30_mcp.notify import RecordedTexts
 from fx30_mcp.rig import Rig
@@ -551,3 +552,166 @@ def test_an_unreachable_light_in_setup_says_it_is_retrying():
     assert "Retrying on its own. If the amaran or Sidus Link app is open on your phone, close it." in details
     assert not any("start the coach again" in d for d in details)
     assert [kind for kind, _ in texts.sent] == ["light"]
+
+
+def test_settle_holds_the_tint_when_asked():
+    camera, key = sim(aperture="f/11", green_cast=0.12)
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(30, fix_tint=False))
+    assert result["light"]["tint"] == 0
+    assert all(w[2] == 0 for _t, w in key.timed)
+    fixed, *_ = make(*sim(aperture="f/11", green_cast=0.12), camera_moves=False)
+    assert asyncio.run(fixed.settle(30))["light"]["tint"] != 0  # the default still takes the cast out
+
+
+def test_settle_in_slog3():
+    camera, key = sim(aperture="f/11", profile="slog3")
+    settings = Settings(profile="slog3")
+    key.state.brightness = 100  # calibrated as sim() does, but in slog3: a stop over at full
+    under = meter.stops_off(meter.read(camera.render(), SIM_FACE).lit, settings.target, "slog3")
+    camera.gain *= 2 ** (under + 1.0)
+    key.state.brightness = 30
+    director, states, texts, clock = make(camera, key, settings, camera_moves=False)
+    result = asyncio.run(director.settle(40))
+    assert result["done"] is True
+    level = meter.read(camera.render(), SIM_FACE).lit
+    assert abs(meter.stops_off(level, settings.target, "slog3")) <= 1 / 6
+
+
+def test_settle_puts_the_key_at_the_given_kelvin_and_leaves_the_cameras_white_balance():
+    camera, key = sim(aperture="f/11")
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(10, kelvin=3200))
+    assert result["light"]["kelvin"] == key.state.kelvin == 3200
+    assert camera.kelvin is None
+
+
+def test_settle_with_an_unreachable_light_says_close_the_app_once():
+    camera, key = sim(aperture="f/11")
+
+    async def broken(*_args, **_kwargs):
+        raise LinkError("could not connect to the light")
+
+    key.set_white = broken
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(3))
+    assert result["done"] is False
+    assert result["notes"] == [
+        "The light isn't answering. If the amaran or Sidus Link app is open on your phone, close it "
+        "or turn off the phone's Bluetooth, then call balance_shot again."
+    ]
+    assert "Retrying" not in str(result)
+
+
+def test_settle_names_any_other_light_failure():
+    camera, key = sim(aperture="f/11")
+
+    async def broken(*_args, **_kwargs):
+        raise ValueError("bad reply")
+
+    key.set_white = broken
+    director, states, texts, clock = make(camera, key, camera_moves=False)
+    result = asyncio.run(director.settle(2))
+    assert result["notes"] == ["A light stopped answering: bad reply."]
+
+
+# Ported from the coach's tests: behaviour the director kept.
+
+
+def test_no_face_at_the_start_asks_to_sit_in_the_shot(face):
+    face["on"] = False
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+    assert asyncio.run(director.start()) is None
+    assert director.plan is None
+    last = states[-1]
+    assert last["screen"] == "plan" and last["plan"] is None
+    assert (last["instruction"], last["detail"]) == ("Sit in the shot", "The coach needs your face in the frame to plan.")
+    assert last["lights"]["face"] == "red"
+
+
+def test_key_output_save_keeps_settings_changed_during_the_session():
+    camera, key = sim(curve=1.0)
+    director, states, texts, clock = make(camera, key, Settings(key_modifier="softbox", key_size_in=24))
+    done = {}
+
+    def script(_t: float) -> None:
+        if director.status()["step"] == "place_key" and "saved" not in done:
+            done["saved"] = True
+            saved = config.load()
+            saved.face_level = 0.42
+            config.save(saved)
+        if director.status()["step"] == "ready":
+            director.stop()
+
+    go(director, clock, script)
+    saved = config.load()
+    assert saved.key_output is not None and saved.face_level == 0.42
+
+
+def test_camera_readback_in_other_forms_needs_no_card_writes():
+    camera, key = sim()
+    real = camera.settings
+
+    async def readback():
+        return {**await real(), "aperture": "6.3", "shutter": '1/60"', "iso": "ISO 800"}
+
+    camera.settings = readback
+    settings = Settings(key_modifier="softbox", key_size_in=24)
+    director, states, texts, clock = make(camera, key, settings)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    assert [s for s in camera.sets if s[1] in ("aperture", "shutter", "iso")] == []
+    assert settings.key_output["exposure"] == pytest.approx(exposure_of("800", "1/60", SETTLED), abs=0.01)
+
+
+def test_a_dim_key_is_turned_up_before_the_key_check():
+    camera, key = sim()
+    key.state.brightness = 1  # on, but too dim for the check to see
+    director, states, texts, clock = make(camera, key)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    assert not any(s["instruction"] == "Turn the key on" for s in states)
+    assert (director.plan.kelvin, director.plan.key_percent or 50, 0) in key.writes
+
+
+def test_a_slow_light_says_connecting_then_carries_on(monkeypatch):
+    from fx30_mcp import rig as rig_module
+
+    monkeypatch.setattr(rig_module, "SLOW_LIGHT", 0.01)
+    camera, key = sim()
+    real = key.set_white
+    calls = []
+
+    async def slow_first(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            await asyncio.sleep(0.1)  # connecting over Bluetooth
+        await real(*args, **kwargs)
+
+    key.set_white = slow_first
+    director, states, texts, clock = make(camera, key)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    shown = [(s["instruction"], s["detail"]) for s in states]
+    i = shown.index(("Connecting to the light", "This can take up to two minutes."))
+    assert states[i + 1] == states[i - 1]  # back to what it showed before
+    assert shown.count(("Connecting to the light", "This can take up to two minutes.")) == 1
+    assert ("Ready to record", None) in shown
+
+
+def test_unexpected_error_says_so_and_reraises():
+    camera, key = sim()
+    director, states, texts, clock = make(camera, key)
+
+    async def broken():
+        raise RuntimeError("bug")
+
+    async def main():
+        await director.start()
+        camera.settings = broken
+        await director.run()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(main())
+    assert (states[-1]["step"], states[-1]["instruction"]) == ("stopped", "Coach stopped")
+    assert states[-1]["detail"] == "Something went wrong: RuntimeError."
+    assert director.running is False
+    assert [kind for kind, _ in texts.sent] == ["stopped"]

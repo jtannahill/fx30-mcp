@@ -253,3 +253,17 @@ def test_key_placed():
     assert not key_placed(KeyCheck(sides=(0.3, 0.5), lit="right"), "left")
     assert key_placed(KeyCheck(sides=(0.3, 0.5), lit="right"), "right")
     assert not key_placed(KeyCheck(sides=(0.0, 0.0), lit=None), "left")
+
+
+def test_balance_mode_leaves_the_tint_when_told_to():
+    goal = dataclasses.replace(make_goal(), fix_tint=False)
+    scene, rig = make_scene(hue=140.0, camera=OFF_PLAN), make_rig(tint=2, camera=OFF_PLAN)
+    assert decide(scene, rig, goal, "balance", History(), 0.0).light is None
+    moves = decide(make_scene(level=level_for(1.0), hue=140.0, camera=OFF_PLAN), rig, goal, "balance", History(), 0.0)
+    assert moves.light.tint == 2 and moves.light.brightness > 30.0
+
+
+def test_readback_in_other_forms_matches_the_card():
+    plain = go().camera
+    worded = {**CAMERA, "iso": "ISO 800", "shutter": '1/60"', "aperture": "4"}
+    assert go(scene=make_scene(camera=worded), rig=make_rig(camera=worded)).camera == plain

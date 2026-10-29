@@ -12,42 +12,49 @@ For an interview, set the camera once and let the light do the work:
 - ISO at a native base (800 or 2500 in S-Log3).
 - Aperture for the depth of field you want. The FX30 has no built-in ND.
 
-`balance_shot` then:
+`balance_shot` then works the key light alone (it never touches the camera):
 
-1. Sets the light and the camera's white balance to the same colour temperature.
-2. Reads a live-view frame, finds the face with Apple Vision and meters the
+1. Reads a live-view frame, finds the face with Apple Vision and meters the
    middle of it (cheeks, nose, forehead).
-3. Works out how many stops the face is off the target and moves the light's
+2. Works out how many stops the face is off the target and moves the key's
    brightness by that much, until it is within a sixth of a stop.
-4. Reads the skin's hue the way a vectorscope does. Skin of every tone sits
+3. Reads the skin's hue the way a vectorscope does. Skin of every tone sits
    near one line on the scope, so a face pushed off it toward green or magenta
-   gets corrected with the light's tint. If a tint step makes the cast worse,
-   the light counts tint the other way: it flips and remembers.
+   gets corrected with the key's tint (`fix_tint=False` leaves the tint alone).
 
-If the light runs out of range, it says what to change instead: ISO, aperture,
-or the light's distance (half the distance is two stops more).
+If the key runs out of range, it says how to move it instead (half the
+distance is two stops more). `match_white` puts the camera and the lights on one
+colour temperature. While the camera records, `balance_shot` leaves the light
+alone.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `coach_shot` | Plans the camera and lights for this room, then coaches you through it from a page on your phone (QR code and link); saves what is on the key light |
+| `coach_shot` | Plans the camera and light for this room, sets up the shot with you from a page on your phone (QR code and link, also texted), then watches every take; saves what is on the key light |
+| `shot_status` | What the coach is doing (setup, take, stopped), what the page shows, the take so far and the last take's report |
 | `stop_coach` | Ends the coach and its page; camera and lights stay as they are |
 | `look` | Shows a live-view frame and meters the face against the target |
-| `balance_shot` | Matches white balance, then lights the face to the target |
+| `balance_shot` | Lights the face to the target with the key light alone; never touches the camera |
 | `set_face_target` | Saves the face brightness and skin colour to aim for: light it how you like, then call it with no level |
 | `match_white` | Light and camera to one colour temperature |
 | `set_lights` | The key light (on the face), the fill (on the shadow side) and the lighting ratio; with nothing given, lists the lights amaran Desktop has paired |
 | `get_camera` / `set_camera` | ISO, shutter, aperture, white balance, exposure mode, recording state; set_camera reads each value back before reporting it |
-| `start_recording` / `stop_recording` | Record to the card; starting stops the coach first |
+| `start_recording` / `stop_recording` | Record to the card; a running coach watches the take and carries on after it |
 
 ## Shot coach
 
-Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). If the camera cannot report them, also give `frame_rate` (23.976 to 60; 24p plans on a 1/50 shutter) and `widest_aperture` (the lens's widest f-number); all of these are saved. It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. The coach puts the camera in M and sets ISO, shutter and aperture itself over USB, confirming each by readback; only a setting the camera refuses is left for you to set by hand. It never writes to the camera while it is recording. Then it walks you through placing the key, the fill and the balance until it says Ready to record.
+Call `coach_shot` with what is on the 100x S (bare, reflector, softbox, lantern or umbrella, and its size in inches for the last three). If the camera cannot report them, also give `frame_rate` (23.976 to 60; 24p plans on a 1/50 shutter) and `widest_aperture` (the lens's widest f-number); all of these are saved. It looks at the room with the lights off, makes a plan (card settings, which side the key goes, how far, how high) and serves a page to open on your phone over the local network. The page is behind a random key in the link and shows one instruction at a time, readable from 4 ft. Natasha texts you the link too.
 
-The 100x S is reached over Bluetooth, and it takes one connection at a time. When a light is slow to answer the page says "Connecting to the light" (it can take up to two minutes). If it cannot connect, the coach stops and says so: close the amaran or Sidus Link app on your phone, or turn off the phone's Bluetooth, then start the coach again.
+There is nothing to tap. The coach puts the camera in M and sets ISO, shutter and aperture itself over USB, confirming each by readback. It turns the key on and checks which side of your face it lights, asks you to move it if it is on the wrong side or the catchlight is off, and sees for itself when you have moved it. Then it balances the key until the page says Ready to record.
 
-Without an ND filter the plan stops the lens down to f/11, then f/16, then raises the shutter through 1/125, 1/250 and 1/500, and tells you when a bright window still cannot be held. `balance_shot` refuses while the coach runs; `stop_coach` (or `start_recording`) ends it.
+Then press record, on the camera or with `start_recording`. During a take the coach holds what recording started with: the key follows your face in brightness and colour, slowly enough not to show, and the camera steps one third of a stop at a time (aperture first, then ISO, then shutter) when the window brightens or darkens. If the face and the window cannot both be held, the face wins and the window is let clip. If you change the camera by hand mid-take, the coach leaves the camera alone for the rest of that take. When recording stops, the page shows the take's report and Natasha texts it to you; the coach goes back to watching for the next take. `shot_status` gives Claude the same state and the last report. It also texts when the light stops answering, the camera battery runs low, the camera overheats, a card has a problem, or the coach stops on an error.
+
+The coach runs until `stop_coach`, or 30 minutes with nothing recorded. `start_recording` and `stop_recording` only start and stop a take. For now the coach lights with the key only; a fill set with `set_lights` is left as it is.
+
+The 100x S is reached over Bluetooth, and it takes one connection at a time. When a light is slow to answer the page says "Connecting to the light" (it can take up to two minutes). If it cannot connect when the coach starts, `coach_shot` says so: close the amaran or Sidus Link app on your phone, or turn off the phone's Bluetooth, then start the coach again. If the light drops later, the coach keeps trying and texts you once.
+
+Without an ND filter the plan stops the lens down to f/11, then f/16, then raises the shutter through 1/125, 1/250 and 1/500, and tells you when a bright window still cannot be held. `balance_shot` refuses while the coach runs; `stop_coach` ends it.
 
 ## Setup
 
@@ -62,10 +69,10 @@ claude mcp add -s user fx30 -- uv --directory ~/src/fx30-mcp run fx30-mcp serve
 ```
 
 With several amaran lights paired in amaran Desktop, `set_lights` picks the key
-(say a 100x S) and the fill (say a PT2c). `balance_shot` then sets the camera and
-both lights to one colour temperature, exposes the lit side of the face with the
-key, and sets the fill so the shadow side sits `fill_ratio` stops below it: 1 is
-the classic 2:1 interview look, 2 is a moodier 4:1.
+(say a 100x S) and the fill (say a PT2c), and the lighting ratio `fill_ratio`
+(1 is the classic 2:1 interview look, 2 is a moodier 4:1). `match_white` puts the
+camera and both lights on one colour temperature. `coach_shot` and
+`balance_shot` light with the key only for now and leave the fill as it is.
 
 The light comes from [amaran-mcp](https://github.com/jtannahill/amaran-mcp)
 (a sibling checkout in `../amaran-mcp`), through amaran Desktop when it is

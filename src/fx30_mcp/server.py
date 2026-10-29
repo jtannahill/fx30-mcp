@@ -9,6 +9,7 @@ import functools
 import json
 import logging
 import os
+import time
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -18,9 +19,12 @@ from mcp.types import TextContent, ToolAnnotations
 from pydantic import Field
 
 from . import config, meter
-from .balance import balance
 from .camera import CameraBase, CameraError, GPhotoCamera
-from .coach import UNREACHABLE, Coach, LightError, LightUnreachable
+from .config import Settings
+from .decide import UNREACHABLE
+from .director import Director
+from .notify import Texts, texts_for_server
+from .rig import LightError, LightUnreachable, Rig
 from .web import Broadcaster, WebHandle, start_web
 
 log = logging.getLogger(__name__)
@@ -32,10 +36,11 @@ _camera: CameraBase | None = None
 _sim_light: Any = None
 _named_lights: dict[tuple[str, str], Any] = {}  # (name, backend) -> light
 _busy = asyncio.Lock()
-_coach: Coach | None = None  # the shot coach, while one runs; it holds _busy
+_director: Director | None = None  # the coach_shot run, from start until stop_coach; it holds _busy while running
 _web: WebHandle | None = None
-_coach_task: asyncio.Task | None = None  # the survey while starting, then Coach.run()
-_holds_busy = False  # True while the coach (not a balance) holds _busy
+_run_task: asyncio.Task | None = None  # the survey while starting, then Director.run()
+_holds_busy = False  # True while a coach_shot run (not a balance) holds _busy
+FILL_NOTE = "The director lights with the key only for now; the fill is left as it is."
 MODIFIERS = ("bare", "reflector", "softbox", "lantern", "umbrella")
 SIZED = ("softbox", "lantern", "umbrella")
 FRAME_RATES = (23.976, 60.0)
@@ -132,7 +137,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         yield
     finally:
         try:
-            await _end_coach()
+            await _end_run()
         finally:
             if _camera is not None:
                 await _camera.close()
@@ -150,12 +155,15 @@ mcp = MCPServer(
         "Controls the user's Sony FX30 over USB (PC Remote) and lights a one-person "
         "talking head with their amaran lights: a key light on the face and an optional "
         "fill on the shadow side (set_lights). The camera records to its own card. "
-        "To set up a shot, call coach_shot: it plans the camera and lights and walks the user "
-        "through placing them on a page on their phone (stop_coach ends it). "
-        "Without the coach: look (check framing), balance_shot (sets white balance on camera and lights, "
-        "then brings the face to the target with the light), start_recording. "
-        "Camera settings are best left fixed for an interview; balance_shot only "
-        "changes the light. set_face_target saves a face brightness the user likes."
+        "To set up a shot, call coach_shot: it plans the camera and light, sets the camera itself and "
+        "shows the user where the key goes on a page on their phone, with no taps. It then watches "
+        "every take until stop_coach (or 30 minutes without recording), holding the face and the "
+        "window steady and texting the user a report after each take. start_recording and "
+        "stop_recording only start and stop a take. shot_status reads what the run is doing and the "
+        "last take's report. Without the coach: look (check framing), match_white (one colour "
+        "temperature for camera and lights), balance_shot (brings the face to the target with the "
+        "key light alone; it never touches the camera), start_recording. set_face_target saves a "
+        "face brightness the user likes."
     ),
     lifespan=lifespan,
 )
@@ -260,23 +268,22 @@ async def balance_shot(
     fix_tint: Annotated[bool, Field(description="Also take out a green or magenta cast with the light's tint")] = True,
     max_steps: Annotated[int, Field(ge=1, le=20)] = 8,
 ) -> dict[str, Any]:
-    """Light the face to the saved target: matches white balance on the camera and both lights,
-    then steps the key light until the lit side of the face is within a sixth of a stop and,
-    with a fill light set, the fill until the shadow side sits fill_ratio stops below it.
-    Leaves the camera's exposure settings alone and says what to change if a light runs out
-    of range."""
+    """Light the face to the saved target with the key light alone: steps its brightness until
+    the face is within a sixth of a stop (and, with fix_tint, its tint until the skin sits on the
+    skin line). kelvin sets the key's colour temperature; match_white sets the camera's to match.
+    Never touches the camera, and leaves the light alone while the camera records. Returns the
+    key's settings and, as advice, what to change if the light runs out of range."""
 
-    if _coach_task is not None and not _coach_task.done():
+    if _run_task is not None and not _run_task.done():
         raise ToolError("the shot coach is running; stop_coach first")
     if _busy.locked():
         raise ToolError("a balance is already running")
     async with _busy:
         await take_over_light()
-        settings = config.load()
-        sign = settings.tint_sign
-        result = await balance(camera(), light(), settings, kelvin, fix_tint, max_steps, fill=fill_light())
-        if settings.tint_sign != sign:
-            config.save(settings)
+        director = _new_director(config.load(), lambda _state: None, _NoTexts(), camera_moves=False)
+        result = await director.settle(max_steps, kelvin, fix_tint)
+        if director.settings.fill_light is not None:
+            result["notes"].append(FILL_NOTE)
         return result
 
 
@@ -353,17 +360,15 @@ async def set_lights(
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 async def start_recording() -> str:
-    """Start recording to the camera's card."""
+    """Start recording to the camera's card. A coach_shot run carries on and watches the take."""
 
-    if _coach is not None:
-        await _end_coach()  # live view must not be read while recording
     await camera().record(True)
     return "recording"
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 async def stop_recording() -> str:
-    """Stop recording to the camera's card."""
+    """Stop recording to the camera's card. A coach_shot run reports the take and carries on."""
 
     await camera().record(False)
     return "stopped"
@@ -376,17 +381,40 @@ def _release_busy() -> None:
         _busy.release()
 
 
-async def _end_coach() -> bool:
-    """Stop the coach and its page and release _busy; False when no coach was running.
+class _NoTexts:
+    """balance_shot returns its result to Claude; it texts nobody."""
+
+    async def send(self, kind: str, body: str) -> None:
+        pass
+
+
+def _new_director(settings: Settings, publish: Any, texts: Texts, **options: Any) -> Director:
+    """A Director on a fresh Rig for the camera and key; the two share one clock."""
+
+    director: Director | None = None
+    clock = time.monotonic
+    rig = Rig(
+        camera(),
+        light(),
+        on_slow=lambda: director.light_slow(),
+        on_back=lambda: director.light_back(),
+        clock=clock,
+    )
+    director = Director(rig, settings, publish, texts, clock=clock, **options)
+    return director
+
+
+async def _end_run() -> bool:
+    """Stop the run and its page and release _busy; False when no run was going.
     Camera and lights are left as they are."""
 
-    global _coach, _web, _coach_task
-    coach, web, task = _coach, _web, _coach_task
-    if coach is None:
+    global _director, _web, _run_task
+    director, web, task = _director, _web, _run_task
+    if director is None:
         return False
-    _coach = _web = _coach_task = None
+    _director = _web = _run_task = None
     try:
-        coach.stop()
+        director.stop()
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -402,13 +430,13 @@ async def _end_coach() -> bool:
     return True
 
 
-def _coach_finished(task: asyncio.Task) -> None:
-    """The coach's run ended on its own (Ready, or stopped after an error): free _busy and
-    keep the page up showing the final state, until stop_coach, start_recording or a new coach_shot."""
+def _run_finished(task: asyncio.Task) -> None:
+    """The run ended on its own (30 minutes idle, or a camera error): free _busy and keep the
+    page up showing the final state, until stop_coach or a new coach_shot."""
 
     if not task.cancelled() and task.exception() is not None:
         log.error("the shot coach failed", exc_info=task.exception())
-    if task is _coach_task:
+    if task is _run_task:
         _release_busy()
 
 
@@ -420,11 +448,13 @@ async def coach_shot(
     frame_rate: Annotated[float | None, Field(ge=FRAME_RATES[0], le=FRAME_RATES[1], description="Frames per second the camera records, e.g. 23.976 or 29.97, when it cannot say; saved")] = None,
     widest_aperture: Annotated[float | None, Field(ge=APERTURE_RANGE[0], le=APERTURE_RANGE[1], description="The lens's widest f-number, e.g. 2.8, when the camera cannot say; saved")] = None,
 ) -> list[Image | TextContent]:
-    """Plan the shot and coach the user through it from a page on their phone: camera settings,
-    where the key and fill go, then the balance. Returns a QR code and the link; the plan is in
-    the JSON. stop_coach ends it."""
+    """Plan the shot and run the director: it sets the camera itself, shows the user where the
+    key goes on a page on their phone (no taps), balances the light until Ready, then watches
+    every take, holding the face and window steady and texting a report after each. Returns a
+    QR code and the link (also texted); the plan is in the JSON. shot_status reads the run;
+    stop_coach ends it."""
 
-    global _coach, _web, _coach_task, _holds_busy
+    global _director, _web, _run_task, _holds_busy
     if key_side not in (None, "left", "right"):
         raise ToolError("key_side must be left or right")
     if modifier is not None and modifier not in MODIFIERS:
@@ -433,9 +463,9 @@ async def coach_shot(
         raise ToolError(f"frame_rate must be from {FRAME_RATES[0]:g} to {FRAME_RATES[1]:g}")
     if widest_aperture is not None and not APERTURE_RANGE[0] <= widest_aperture <= APERTURE_RANGE[1]:
         raise ToolError(f"widest_aperture must be from {APERTURE_RANGE[0]:g} to {APERTURE_RANGE[1]:g}")
-    if _coach_task is not None and not _coach_task.done():
+    if _run_task is not None and not _run_task.done():
         raise ToolError("a balance or the shot coach is already running")
-    await _end_coach()  # a coach that finished still has its page up
+    await _end_run()  # a run that ended on its own still has its page up
     if _busy.locked():
         raise ToolError("a balance or the shot coach is already running")
     settings = config.load()
@@ -456,17 +486,18 @@ async def coach_shot(
         settings.frame_rate, settings.widest_aperture = new_rate, new_widest
         config.save(settings)
     broadcaster = Broadcaster()
-    coach = Coach(camera(), light(), fill_light(), settings, broadcaster.publish, override=key_side)
+    texts = texts_for_server()
+    director = _new_director(settings, broadcaster.publish, texts, override=key_side)
     await _busy.acquire()
     _holds_busy = True
-    _coach = coach  # from here, stop_coach and start_recording can end it
+    _director = director  # from here, stop_coach can end it
     try:
         if (await camera().settings())["recording"]:
             raise ToolError("The camera is recording. Stop recording before setting up the shot.")
         await take_over_light()
-        if _coach is not coach:
+        if _director is not director:
             raise ToolError("the shot coach was stopped before it began")
-        start = _coach_task = asyncio.create_task(coach.start())
+        start = _run_task = asyncio.create_task(director.start())
         try:
             plan = await start
         except LightUnreachable as err:
@@ -475,31 +506,44 @@ async def coach_shot(
         except LightError as err:
             raise ToolError(str(err)) from err
         except asyncio.CancelledError:
-            if start.cancelled() and _coach is not coach:
+            if start.cancelled() and _director is not director:
                 raise ToolError("the shot coach was stopped before it began") from None
             raise  # the client cancelled coach_shot itself
         if plan is None:
             raise ToolError("No face in the frame. Sit in the shot, then call coach_shot again.")
-        web = await start_web(coach, broadcaster)
-        if _coach is not coach:
+        web = await start_web(director, broadcaster)
+        if _director is not director:
             await web.close()
             raise ToolError("the shot coach was stopped before it began")
+        _web = web
+        _run_task = asyncio.create_task(director.run())
+        _run_task.add_done_callback(_run_finished)
+        await texts.send("link", f"Shot coach: {web.url}")
     except BaseException:
-        if _coach is coach:
-            await _end_coach()
+        if _director is director:
+            await _end_run()
         raise
-    _web = web
-    _coach_task = asyncio.create_task(coach.run())
-    _coach_task.add_done_callback(_coach_finished)
-    return [Image(data=web.qr_png, format="png"),
-            TextContent(type="text", text=json.dumps({"url": web.url, "plan": plan.to_json()}))]
+    body: dict[str, Any] = {"url": web.url, "plan": plan.to_json()}
+    if settings.fill_light is not None:  # the saved setting: the fill itself is not reached here
+        body["note"] = FILL_NOTE
+    return [Image(data=web.qr_png, format="png"), TextContent(type="text", text=json.dumps(body))]
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 async def stop_coach() -> str:
-    """End the shot coach and its phone page. The camera and lights stay as they are."""
+    """End the coach_shot run and its phone page. The camera and lights stay as they are."""
 
-    return "coach stopped" if await _end_coach() else "no coach was running"
+    return "coach stopped" if await _end_run() else "no coach was running"
+
+
+@tool(annotations=READS)
+async def shot_status() -> dict[str, Any]:
+    """What the coach_shot run is doing: its mode (setup, take, stopped), the step and instruction
+    the page shows, the face and window lights, the take so far and the last take's report.
+    {"mode": "off"} when no run is going."""
+
+    director = _director
+    return {"mode": "off"} if director is None else director.status()
 
 
 def serve() -> None:

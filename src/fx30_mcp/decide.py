@@ -94,6 +94,7 @@ class Goal:
     frame_rate: float
     widest: float
     geometry: Geometry  # where the key should be, for instructions
+    fix_tint: bool = True  # False: setup and balance leave the key's tint as it is (balance_shot(fix_tint=False))
 
 
 @dataclass(frozen=True)
@@ -210,7 +211,9 @@ def _camera_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
 
 def _card_move(scene: Scene, rig: RigState, goal: Goal) -> CameraMove | None:
     stops = exposure_change(scene.window, goal.face_level, goal.profile, goal.window_range)
-    card = camera_card(rig.camera, stops, goal.frame_rate, goal.widest, scene.window is not None)
+    # The camera reads back in several forms ("ISO 800", '1/60"', "6.3"); the card wants one.
+    readback = {s: canonical(s, rig.camera[s]) for s in CARD_SETTINGS if rig.camera.get(s) is not None}
+    card = camera_card({**rig.camera, **readback}, stops, goal.frame_rate, goal.widest, scene.window is not None)
     for setting in CARD_SETTINGS:
         current = canonical(setting, rig.camera.get(setting))
         wanted = canonical(setting, getattr(card, setting))
@@ -305,7 +308,7 @@ def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, light_only
                     ask = Ask("Key closer", f"{fmt_ft(distance)} to {fmt_ft(closer(distance, stops))}")
             else:
                 ask = Ask("Key farther", f"{fmt_ft(distance)} to {fmt_ft(closer(distance, stops))}")
-    tint = _tint_step(scene, rig, goal)
+    tint = _tint_step(scene, rig, goal) if goal.fix_tint else rig.tint
     new_brightness = round(new_brightness, 1)
     light = None
     if (new_brightness, tint) != (round(brightness, 1), rig.tint):

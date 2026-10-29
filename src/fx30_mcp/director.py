@@ -57,6 +57,11 @@ RETRYING = (
     "Retrying on its own. If the amaran or Sidus Link app is open on your phone, close it.",
 )
 RECORDING_NOTE = "The camera is recording; balance_shot leaves the light alone during a take."
+# balance_shot returns once, so it cannot say it is retrying: it says what to do and to call it again.
+BALANCE_UNREACHABLE = (
+    "The light isn't answering. If the amaran or Sidus Link app is open on your phone, close it "
+    "or turn off the phone's Bluetooth, then call balance_shot again."
+)
 
 
 class _Stopped(Exception):
@@ -179,11 +184,12 @@ class Director:
             self.mode = "stopped"
             self._hold(False)
 
-    async def settle(self, max_ticks: int, kelvin: int | None = None) -> dict[str, Any]:
+    async def settle(self, max_ticks: int, kelvin: int | None = None, fix_tint: bool = True) -> dict[str, Any]:
         """Setup until Ready or max_ticks, for balance_shot: whether it got there, the key, and any ask.
 
         With camera_moves off there is no survey (it switches the key off): the goal comes from the
-        settings, at kelvin, or the key's own colour temperature. Nothing is written while recording."""
+        settings, at kelvin, or the key's own colour temperature. With fix_tint off the key's tint is
+        left as it is. Nothing is written while recording."""
 
         notes: list[str] = []
         done = False
@@ -195,6 +201,8 @@ class Director:
                 self.goal = self._light_goal(kelvin)
             elif self.goal is None and await self.start() is None:
                 self._last_ask = Ask(*NO_FACE)
+            if self.goal is not None and self.goal.fix_tint != fix_tint:
+                self.goal = dataclasses.replace(self.goal, fix_tint=fix_tint)
             while self.goal is not None and not notes and max_ticks > 0 and not self._stopping:
                 max_ticks -= 1
                 scene, rig, now = await self._read()
@@ -208,8 +216,11 @@ class Director:
                 await self.sleep(self._settle)
         finally:
             self._hold(False)
-        if self._light_problem is not None:
-            notes.append(" ".join(p for p in self._light_problem if p))
+        if self._light_problem == RETRYING:
+            notes.append(BALANCE_UNREACHABLE)
+        elif self._light_problem is not None:
+            instruction, detail = self._light_problem
+            notes.append(f"{instruction}: {detail.rstrip('.')}." if detail else f"{instruction}.")
         light, ask = self.rig.key.state, self._last_ask
         words = [] if ask is None else [p if p.endswith(".") else p + "." for p in (ask.instruction, ask.detail) if p]
         return {
@@ -523,8 +534,9 @@ class Director:
         if not scene.face or not brightness:
             return
         try:
-            exposure = exposure_of(str(camera["iso"]), str(camera["shutter"]), str(camera["aperture"]))
-        except (KeyError, ValueError, ZeroDivisionError):
+            # Readback comes in several forms ("ISO 800", '1/60"', "6.3"); exposure_of wants plain numbers.
+            exposure = exposure_of(*(canonical(s, camera[s]) for s in ("iso", "shutter", "aperture")))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
             return
         stops = meter.stops_off(scene.level, self.goal.face_level, self.profile)
         self.settings.key_output = {
