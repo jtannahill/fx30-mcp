@@ -428,8 +428,8 @@ def test_white_balance_never_moves_in_a_take():
 
 
 def test_take_changes_only_what_it_may():
-    smoothing = ("window_scene", "window_seconds", "window_bound", "clip_ceiling", "clip_scene", "meter_scene",
-                 "last_move", "last_move_scene")
+    smoothing = ("window_scene", "window_seconds", "window_bound", "clip_ceiling", "clip_scene", "clip_share",
+                 "meter_scene", "last_move", "last_move_scene", "last_move_exposure")
     allowed = ("hands_off", "last_tint_step", *smoothing)
     for scene, rig, history in take_table():
         before = dataclasses.replace(history, commanded=dict(history.commanded))
@@ -514,7 +514,9 @@ def test_a_clipped_frame_is_remembered_through_the_take():
     low = make_scene(window=seen_at(0.0, aperture="f/14"), aperture="f/14")
     for tick in range(1, 40):
         history.last_tick = NOW + tick - 1
-        assert go(scene=low, history=history, now=NOW + tick).camera is None
+        moves = go(scene=low, history=history, now=NOW + tick)
+        assert moves.camera is None
+    assert moves.held == "window dark; a step brighter clipped"  # said in the take's report
     # The light falls more than a stop below where it clipped: the memory clears and the camera opens up.
     dark = make_scene(window=seen_at(0.95 - 1.3, aperture="f/14"), aperture="f/14")
     moves, _tick = held(dark, history, ticks=40)
@@ -531,7 +533,9 @@ def test_the_camera_does_not_turn_back_unless_the_light_moved_more_than_the_band
     history.window_scene = window_scene(low.window.level, "rec709", camera_exposure(CAMERA))
     for tick in range(20):
         history.last_tick = NOW + tick - 1
-        assert go(scene=low, history=history, now=NOW + tick).camera is None
+        moves = go(scene=low, history=history, now=NOW + tick)
+        assert moves.camera is None
+    assert moves.held == "window dark; too soon to turn back"
     # Moved more than the band since that step, it opens up.
     lower = make_scene(window=window_over(0.75 - 0.8))
     moves, _tick = held(lower, history, ticks=20)

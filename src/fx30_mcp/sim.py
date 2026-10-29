@@ -90,6 +90,7 @@ class SimCamera(CameraBase):
         key_spill: float = 1.0,  # share of the key reaching the half of the face away from the key
         window: float = 0.0,  # linear level of a window at the right of the frame, 0 for none
         glint: float = 0.0,  # share of the window drawn at white
+        glint_stops: float | None = None,  # or this many stops over the window, so stopping down tames it
         ambient: float = 0.0,  # room light on the face, mostly on the rim_side half
         rim_side: str = "right",
         key_side: str = "left",
@@ -112,6 +113,7 @@ class SimCamera(CameraBase):
         self.key_spill = key_spill
         self.window = window
         self.glint = glint
+        self.glint_stops = glint_stops
         self.ambient = ambient
         self.rim_side = rim_side
         self.key_side = key_side
@@ -155,7 +157,8 @@ class SimCamera(CameraBase):
         frame = np.full((180, 320, 3), float(encode(np.array(0.02 * key * scale))))
         if self.window:
             frame[0:140, 250:320] = encode(np.array(self.window * scale))
-            frame[0 : round(140 * self.glint), 250:320] = 1.0
+            bright = 1.0 if self.glint_stops is None else encode(np.array(self.window * scale * 2**self.glint_stops))
+            frame[0 : round(140 * self.glint), 250:320] = bright
         for x, half in ((100, 0), (160, 1)):
             other = (fill_halves[half] + self.ambient * rim[half]) * scale
             level = tone * other + tone * key_tint * key_halves[half] * scale

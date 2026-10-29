@@ -73,6 +73,7 @@ class Watched(SimCamera):
         self.noise = 0.0
         self.rng = random.Random(29)
         self.glint_frames = 0
+        self.gamma = "S-Log3"  # what describe() says: "Rec709" makes the director judge the window truthfully
 
     async def set(self, setting, value):
         if value in self.refuse:
@@ -85,6 +86,9 @@ class Watched(SimCamera):
 
     async def settings(self):
         return {**await super().settings(), "battery": self.battery}
+
+    async def describe(self):
+        return {**await super().describe(), "gamma": self.gamma}
 
     async def frame(self):
         if self.fail_frames:
@@ -1091,3 +1095,37 @@ def test_it_does_not_jump():
     assert "start" in mark and clock.t - mark["start"] > 120
     assert director.history.clip_ceiling is not None  # the glints were seen as clipping
     assert reversals(camera, start) == 0
+
+
+def test_a_window_that_keeps_clipping_is_darkened_until_ready():
+    # Rec.709 judged truthfully, so a clipping window is red and Ready waits on it. A bright patch of sky,
+    # 5% of the window and 1.5 stops over the rest of it, clips at the card the window's median wants.
+    camera, key = sim(stops_at_full=2.5)
+    camera.gamma = "Rec709"
+    camera.glint, camera.glint_stops = GLINT, 1.5
+    start = dict(camera.values)
+    director, states, texts, clock = make(camera, key)
+    go(director, clock, after_ready(director, lambda s: s > 5 and director.stop()), limit=120)
+    assert ("ready", "Ready to record") in [(s["step"], s["instruction"]) for s in states]
+    steps = [exposure_of(**start)] + [e for _t, e in exposures(camera, start)]
+    assert len(steps) >= 3 and all(b < a for a, b in zip(steps, steps[1:]))
+    ready = next(s for s in states if s["step"] == "ready")
+    assert ready["lights"]["window"] != "red"
+
+
+def test_a_stop_down_by_hand_after_ready_is_corrected():
+    camera, key = sim()
+    camera.values["aperture"] = "f/6.3"  # setup darkens to f/7.1 first: the director's last move
+    director, states, texts, clock = make(camera, key)
+    mark = {}
+
+    def then(s: float) -> None:
+        if "hand" not in mark:
+            mark["hand"] = clock.t
+            camera.values["aperture"] = "f/14"  # two stops down: the window two stops under its aim
+        if s > 40:
+            director.stop()
+
+    go(director, clock, after_ready(director, then))
+    opened = [v for t, setting, v in camera.sets if t >= mark["hand"] and setting == "aperture"]
+    assert opened and camera.values["aperture"] == SETTLED
