@@ -453,7 +453,11 @@ class GPhotoCamera(CameraBase):
     def _frame(self) -> bytes:
         # Right after recording stops the camera can send an empty frame for a moment.
         for _ in range(10):
-            data = bytes(memoryview(self._camera.capture_preview().get_data_and_size()))
+            # The buffer belongs to the CameraFile: copy it while the file is alive. Freed
+            # first, its start is overwritten and the JPEG loses its header (Oct 29 2026).
+            file = self._camera.capture_preview()
+            data = bytes(memoryview(file.get_data_and_size()))
+            del file
             start, end = data.find(b"\xff\xd8"), data.rfind(b"\xff\xd9")
             if 0 <= start < end:
                 return data[start:end + 2]

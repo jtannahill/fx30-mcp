@@ -121,3 +121,27 @@ def test_a_camera_that_drops_off_usb_for_a_moment_is_opened_on_a_retry(monkeypat
     camera = GPhotoCamera()
     camera._open()
     assert opened == [True] and camera.name == "ILME-FX30"
+
+
+def test_a_frame_is_copied_while_its_file_is_still_alive():
+    # libgphoto2's buffer belongs to the CameraFile: once the file is freed, the
+    # allocator writes over the start of it (seen on the FX30 on 2026-10-29).
+    jpeg = b"\xff\xd8" + b"\x11" * 64 + b"\xff\xd9"
+
+    class File:
+        def __init__(self):
+            self.buffer = bytearray(jpeg)
+
+        def get_data_and_size(self):
+            return memoryview(self.buffer)
+
+        def __del__(self):
+            self.buffer[:32] = b"\x01" * 32
+
+    class Handle:
+        def capture_preview(self):
+            return File()
+
+    camera = GPhotoCamera()
+    camera._camera = Handle()
+    assert camera._frame() == jpeg
