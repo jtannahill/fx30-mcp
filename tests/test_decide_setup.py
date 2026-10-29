@@ -571,3 +571,16 @@ def test_a_young_average_keeps_counting_through_a_clipped_frame_that_does_not_ra
     history.window_seconds = 2.0
     tick(history, AIM, clipped=0.05)
     assert history.window_seconds == pytest.approx(3.0)
+
+
+def test_a_light_without_tint_never_has_its_tint_moved():
+    # The 100x S has no green/magenta control; asking it for tint stops the light (Oct 29 2026).
+    rig = dataclasses.replace(make_rig(), can_tint=False)
+    moves = go(scene=make_scene(hue=123.0 + 9.0), rig=rig)
+    assert moves.light is None or moves.light.tint == 0
+
+
+def test_setup_keeps_the_plan_kelvin_inside_the_lights_range():
+    rig = dataclasses.replace(make_rig(brightness=10.0), kelvin_range=(2700, 5000))
+    moves = go(scene=make_scene(level=level_for(1.0)), rig=rig)  # a stop dark: the key moves
+    assert moves.light is not None and moves.light.kelvin == 5000

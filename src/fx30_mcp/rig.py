@@ -13,7 +13,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from .camera import CameraBase, CameraError
-from .decide import CameraMove, History, LightMove, Moves, RigState
+from .decide import KEY_KELVIN_RANGE, CameraMove, History, LightMove, Moves, RigState
 
 SLOW_LIGHT = 3.0  # seconds before a light call is said to be connecting
 # Seconds from the start of an exposure step's write to the light move riding with it (Task 10 measures it).
@@ -105,7 +105,12 @@ class Rig:
                 await self.key.read_status()
             except LightError as err:
                 self.light_error = err
-        return RigState(light.power, light.brightness, light.kelvin, int(light.tint or 0), camera)
+        caps = getattr(self.key, "caps", None)
+        can_tint = bool(getattr(caps, "tint", True))
+        low, high = getattr(caps, "kelvin_min", None), getattr(caps, "kelvin_max", None)
+        kelvin_range = (int(low), int(high)) if low and high else KEY_KELVIN_RANGE
+        return RigState(light.power, light.brightness, light.kelvin, int(light.tint or 0), camera,
+                        can_tint=can_tint, kelvin_range=kelvin_range)
 
     async def apply(self, moves: Moves, history: History) -> None:
         step, move = moves.camera, moves.light

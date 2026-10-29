@@ -266,3 +266,12 @@ def test_state_keeps_a_failed_light_read():
     r.key._light.state.power = True
     asyncio.run(r.state())
     assert r.light_error is None
+
+
+def test_state_reports_what_the_light_can_do():
+    from fx30_mcp.sim import SimCamera, SimCaps, SimLight
+
+    key = SimLight(caps=SimCaps(tint=False, kelvin_min=2700, kelvin_max=6500))
+    rig = Rig(SimCamera(key), key, lambda: None, lambda: None)
+    state = asyncio.run(rig.state())
+    assert state.can_tint is False and state.kelvin_range == (2700, 6500)

@@ -546,3 +546,15 @@ def test_the_camera_does_not_turn_back_unless_the_light_moved_more_than_the_band
 def test_a_clipped_frame_never_brightens():
     scene = make_scene(window=window_over(0.0, clipped=0.1))
     assert go(scene=scene, history=taking(window=make_scene(window=window_over(-1.0)))).camera is None
+
+
+def test_a_light_without_tint_never_has_its_tint_moved_in_a_take():
+    rig = dataclasses.replace(make_rig(), can_tint=False)
+    moves = go(scene=make_scene(**color_shift(green=0.1)), rig=rig, history=taking(last_tint_step=NOW - TINT_STEP_SECONDS))
+    assert moves.light is None or moves.light.tint == 0
+
+
+def test_key_kelvin_stays_inside_the_lights_own_range():
+    rig = dataclasses.replace(make_rig(kelvin=5500), kelvin_range=(2700, 5600))
+    moves = go(scene=make_scene(**color_shift(warm=0.5)), rig=rig)  # wants a much cooler key
+    assert moves.light is None or moves.light.kelvin <= 5600

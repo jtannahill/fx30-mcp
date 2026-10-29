@@ -124,6 +124,8 @@ class RigState:
     kelvin: int | None
     tint: int
     camera: dict[str, Any]  # iso, shutter, aperture, kelvin, exposure_mode as last read
+    can_tint: bool = True  # False for a light with no green/magenta control (the 100x S)
+    kelvin_range: tuple[int, int] = KEY_KELVIN_RANGE  # the light's own colour temperature range
 
 
 @dataclass(frozen=True)
@@ -622,11 +624,11 @@ def _setup(scene: Scene, rig: RigState, goal: Goal, history: History, now: float
                     ask = Ask("Key closer", f"{fmt_ft(distance)} to {fmt_ft(closer(distance, stops))}")
             else:
                 ask = Ask("Key farther", f"{fmt_ft(distance)} to {fmt_ft(closer(distance, stops))}")
-    tint = _tint_step(scene, rig, goal) if goal.fix_tint else rig.tint
+    tint = _tint_step(scene, rig, goal) if goal.fix_tint and rig.can_tint else rig.tint
     new_brightness = round(new_brightness, 1)
     light = None
     if (new_brightness, tint) != (round(brightness, 1), rig.tint):
-        light = LightMove(new_brightness, goal.kelvin, tint)
+        light = LightMove(new_brightness, min(rig.kelvin_range[1], max(rig.kelvin_range[0], goal.kelvin)), tint)
     return Moves(light=light, ask=ask or window_ask, held=held)  # held: not Ready while the window settles
 
 
@@ -755,10 +757,10 @@ def _take(scene: Scene, rig: RigState, goal: Goal, history: History, now: float)
     if abs(correction) >= KELVIN_DEADBAND:
         cap = KELVIN_PER_SECOND * dt
         new_kelvin = round(kelvin + max(-cap, min(cap, correction)))
-        new_kelvin = min(KEY_KELVIN_RANGE[1], max(KEY_KELVIN_RANGE[0], new_kelvin))
+        new_kelvin = min(rig.kelvin_range[1], max(rig.kelvin_range[0], new_kelvin))
     tint = rig.tint
     wanted_tint = -green * TINT_PER_GREEN * goal.tint_sign  # too green means less green from the light
-    if abs(wanted_tint) >= 1 and now - history.last_tint_step >= TINT_STEP_SECONDS:
+    if rig.can_tint and abs(wanted_tint) >= 1 and now - history.last_tint_step >= TINT_STEP_SECONDS:
         stepped = max(-10, min(10, tint + (1 if wanted_tint > 0 else -1)))
         if stepped != tint:
             tint = stepped
