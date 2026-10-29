@@ -52,7 +52,7 @@ __all__ = ["Director", "IDLE_END_SECONDS", "TAKE_INTERVAL", "report_text"]
 
 TAKE_INTERVAL = 1.0
 IDLE_END_SECONDS = 1800.0
-WORKING_PERCENT = 50  # the key's level for the key check when no percent was predicted
+WORKING_PERCENT = 50  # the key's least level for the key check
 LOW_BATTERY = 15  # percent
 MOVED_STOPS = 1 / 3  # the face or its cheeks changing this much under a key ask: the key was moved
 CARD = ("iso", "shutter", "aperture")
@@ -395,8 +395,10 @@ class Director:
         if history.key_check is None:
             if await self._recording_now():
                 return True
-            # The card is right: the key goes on at a working level, so a dim key is not taken for none.
-            await self.rig.key.set_white(self.goal.kelvin, self.plan.key_percent or WORKING_PERCENT, rig.tint)
+            # The card is right: the key goes on at least at a working level, so a dim key is not
+            # taken for none against strong daylight on the face (20% read as "no key", Oct 29).
+            kelvin = min(rig.kelvin_range[1], max(rig.kelvin_range[0], self.goal.kelvin))
+            await self.rig.key.set_white(kelvin, max(self.plan.key_percent or 0, WORKING_PERCENT), rig.tint)
             await self.rig.key.set_power(True)
             await self._check_key(scene)
             return True

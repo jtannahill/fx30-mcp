@@ -705,7 +705,7 @@ def test_a_dim_key_is_turned_up_before_the_key_check():
     director, states, texts, clock = make(camera, key)
     go(director, clock, after_ready(director, lambda _s: director.stop()))
     assert not any(s["instruction"] == "Turn the key on" for s in states)
-    assert (director.plan.kelvin, director.plan.key_percent or 50, 0) in key.writes
+    assert (director.plan.kelvin, max(director.plan.key_percent or 0, 50), 0) in key.writes
 
 
 def test_a_slow_light_says_connecting_then_carries_on(monkeypatch):
@@ -1184,3 +1184,14 @@ def test_setup_does_not_turn_back_from_off_its_aim(aperture):
 
         go(director, clock, script)
         assert reversals(camera, start) == 0, f"seed {seed}"
+
+
+def test_a_low_predicted_key_is_still_checked_at_a_working_level():
+    # A 20% prediction against strong daylight read as "no key" on the FX30 (Oct 29 2026).
+    camera, key = sim()
+    settings = Settings(key_modifier="reflector", key_output={
+        "modifier": "reflector", "distance_ft": 4.0, "stops_at_full": 5.0, "exposure": 0.0})  # predicts about 20%
+    director, states, texts, clock = make(camera, key, settings)
+    go(director, clock, after_ready(director, lambda _s: director.stop()))
+    assert director.plan.key_percent is not None and director.plan.key_percent < 50
+    assert (director.plan.kelvin, 50, 0) in key.writes
