@@ -353,7 +353,8 @@ def test_an_unreachable_light_at_the_survey_names_the_phone_app(server, monkeypa
 
     async def go():
         monkeypatch.setattr(Coach, "start", fail)
-        with pytest.raises(ToolError, match=r"^The light isn't answering\. If the amaran or Sidus Link app is open on your phone"):
+        with pytest.raises(ToolError, match=r"^The light isn't answering\. If the amaran or Sidus Link app is open on your phone.*"
+                           r"\(Bluetooth said: Found the light but could not connect \(\)\)$"):
             await server.coach_shot(modifier="bare")
         assert server._coach is None and not server._busy.locked()
 

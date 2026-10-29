@@ -462,7 +462,8 @@ async def coach_shot(
         try:
             plan = await start
         except LightUnreachable as err:
-            raise ToolError(f"{UNREACHABLE[0]}. {UNREACHABLE[1]}") from err
+            log.warning("the light could not be reached", exc_info=err)
+            raise ToolError(f"{UNREACHABLE[0]}. {UNREACHABLE[1]} (Bluetooth said: {err})") from err
         except LightError as err:
             raise ToolError(str(err)) from err
         except asyncio.CancelledError:
