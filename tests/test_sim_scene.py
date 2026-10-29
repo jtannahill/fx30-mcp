@@ -63,3 +63,28 @@ def test_stopping_down_darkens_window_and_face_equally():
     drop_window = meter.stops_off(window_luma(camera), window, "rec709")
     assert drop_face == pytest.approx(2.0, abs=0.2)
     assert drop_window == pytest.approx(2.0, abs=0.2)
+
+
+def face_ratio(camera):
+    rgb = np.asarray(Image.open(io.BytesIO(camera.render())).convert("RGB"), dtype=float) / 255
+    patch = rgb[60:120, 110:150].reshape(-1, 3).mean(axis=0)
+    return patch[0] / patch[2]
+
+
+def test_a_warmer_key_than_the_camera_reads_warmer():
+    matched = SimCamera(SimLight(), gain=0.5)
+    matched.kelvin = 5600
+    warm = SimCamera(SimLight(), gain=0.5)
+    warm.kelvin = 5600
+    asyncio.run(warm.light.set_white(4300))
+    assert face_ratio(warm) > face_ratio(matched)
+
+
+def test_sim_status_values():
+    camera = SimCamera(SimLight())
+    status = asyncio.run(camera.settings())
+    assert status["battery"] == 100 and status["overheat"] is False
+    assert status["cards_ok"] is True and status["live_view_effect"] is True
+    assert isinstance(status["meter"], float)
+    camera.hold(True)
+    camera.hold(False)

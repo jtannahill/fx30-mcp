@@ -136,6 +136,11 @@ class SimCamera(CameraBase):
     def render(self) -> bytes:
         scale = 2 ** self.exposure_stops()
         key = self._output(self.light, self.gain) * (3.0 / self.key_distance_ft) ** 2
+        # A key warmer than the camera's white balance reads warm; cooler reads cool.
+        shift = 0.0
+        if self.kelvin and self.light.state.kelvin:
+            shift = (self.kelvin - self.light.state.kelvin) / 1000
+        key_tint = np.array([1 + 0.08 * shift, 1.0, 1 - 0.08 * shift])
         fill = self._output(self.fill, self.fill_gain)
         green = 1 + self.green_cast + 0.02 * (self.light.state.tint or 0) * self.tint_sign
         tone = SKIN * np.array([1.0, green, 1.0])
@@ -148,15 +153,24 @@ class SimCamera(CameraBase):
         if self.window:
             frame[0:140, 250:320] = encode(np.array(self.window * scale))
         for x, half in ((100, 0), (160, 1)):
-            level = (key_halves[half] + fill_halves[half] + self.ambient * rim[half]) * scale
-            frame[40:140, x : x + 60] = encode(np.clip(tone * level, 0, 1.2))
+            other = (fill_halves[half] + self.ambient * rim[half]) * scale
+            level = tone * other + tone * key_tint * key_halves[half] * scale
+            frame[40:140, x : x + 60] = encode(np.clip(level, 0, 1.2))
         pixels = (np.clip(frame, 0, 1) * 255).round().astype(np.uint8)
         out = io.BytesIO()
         Image.fromarray(pixels).save(out, "JPEG", quality=95)
         return out.getvalue()
 
     async def settings(self) -> dict[str, Any]:
-        return {**self.values, "kelvin": self.kelvin, "exposure_mode": self.exposure_mode, "recording": self.recording}
+        level = max(self._output(self.light, self.gain) + self._output(self.fill, self.fill_gain) + self.ambient, 1e-6)
+        return {
+            **self.values, "kelvin": self.kelvin, "exposure_mode": self.exposure_mode, "recording": self.recording,
+            "meter": self.exposure_stops() + math.log2(level), "battery": 100, "overheat": False,
+            "cards_ok": True, "live_view_effect": True,
+        }
+
+    def hold(self, on: bool) -> None:
+        pass
 
     async def describe(self) -> dict[str, Any]:
         return {

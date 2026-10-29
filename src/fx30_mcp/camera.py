@@ -30,7 +30,11 @@ SETTING_NAMES = {
     "white_balance": ["whitebalance"],
     "kelvin": ["colortemperature"],
     "exposure_mode": ["expprogram"],  # "M" lets shutter and ISO be set over USB; "Movie F Mode" does not
+    "live_view_effect": ["liveviewsettingeffect"],  # On shows the exposure in live view; Off shows it flat
 }
+
+# Read-only status, by the names libgphoto2 gives them (d-codes are Sony properties).
+STATUS_NAMES = ["d1b5", "batterylevel", "d251", "d248", "d256", "liveviewsettingeffect"]
 
 # Where describe() reads from. Verified on the real FX30 on Oct 28 2026 (found by
 # label): d241 File Format Movie, d242 Recording Setting Movie, d23f Picture
@@ -62,6 +66,25 @@ def _flag(value: Any) -> bool | None:
     if text in ("off", "0", "false"):
         return False
     return None
+
+
+def parse_status(raw: dict[str, str]) -> dict[str, Any]:
+    """meter (stops), battery (percent), overheat, cards_ok and live_view_effect from the raw
+    values by name; None for any that are missing or unreadable."""
+
+    def number(name: str) -> float | None:
+        match = re.search(r"-?\d+(?:\.\d+)?", str(raw.get(name, "")))
+        return float(match.group()) if match else None
+
+    meter, battery, hot = number("d1b5"), number("batterylevel"), number("d251")
+    cards = [str(raw.get(name, "")).strip() for name in ("d248", "d256")]
+    return {
+        "meter": None if meter is None else meter / 1000,
+        "battery": None if battery is None else int(battery),
+        "overheat": None if hot is None else hot != 0,
+        "cards_ok": None if "" in cards else all(c == "1" for c in cards),
+        "live_view_effect": _flag(raw["liveviewsettingeffect"]) if "liveviewsettingeffect" in raw else None,
+    }
 
 
 WEDGED_HINT = (
@@ -105,6 +128,9 @@ class CameraBase:
     async def set_kelvin(self, kelvin: int) -> None: ...
     async def frame(self) -> bytes: ...
     async def record(self, on: bool) -> None: ...
+    def hold(self, on: bool) -> None:
+        """While held, the camera is not let go between calls."""
+
     async def close(self) -> None: ...
 
 
@@ -141,6 +167,14 @@ class GPhotoCamera(CameraBase):
         self.idle_timeout = idle_timeout
         self.name = "camera"
         self.recording = False
+        self._held = False
+
+    def hold(self, on: bool) -> None:
+        self._held = on
+        if not on and self._camera is not None:
+            if self._idle_task:
+                self._idle_task.cancel()
+            self._idle_task = asyncio.create_task(self._close_when_idle())
 
     async def _thread(self, fn, *args, keep: bool = False):
         """Run fn in a thread and always wait for it to finish, however often the caller is
@@ -193,7 +227,7 @@ class GPhotoCamera(CameraBase):
         so the less time a session is open, the less often that happens."""
 
         await asyncio.sleep(self.idle_timeout)
-        if self.recording:
+        if self.recording or self._held:
             return  # what closing does to a recording is untested; stay with it
         # Once started, finish closing even if a new call arrives; it waits on the lock.
         await asyncio.shield(self._close_locked())
@@ -279,6 +313,8 @@ class GPhotoCamera(CameraBase):
         raise CameraError(f"this camera does not offer {setting} over USB")
 
     def _read(self) -> dict[str, Any]:
+        import gphoto2 as gp
+
         out: dict[str, Any] = {}
         for setting in SETTING_NAMES:
             try:
@@ -286,6 +322,13 @@ class GPhotoCamera(CameraBase):
                 out[setting] = widget.get_value()
             except CameraError:
                 out[setting] = None
+        raw: dict[str, str] = {}
+        for name in STATUS_NAMES:
+            try:
+                raw[name] = str(self._camera.get_single_config(name).get_value())
+            except gp.GPhoto2Error:
+                continue
+        out.update(parse_status(raw))
         return out
 
     def _choices(self, setting: str) -> list[str]:
